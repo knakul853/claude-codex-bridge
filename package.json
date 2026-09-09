@@ -1,0 +1,28 @@
+{
+  "name": "claude-codex-bridge",
+  "version": "0.1.0",
+  "description": "Route structured Claude Code worker handovers to a Codex owner task.",
+  "repository": "github:knakul853/claude-codex-bridge",
+  "homepage": "https://github.com/knakul853/claude-codex-bridge#readme",
+  "bugs": "https://github.com/knakul853/claude-codex-bridge/issues",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "claude-codex-bridge": "./src/cli.ts"
+  },
+  "scripts": {
+    "bridge": "bun run src/cli.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && biome check . && bun test",
+    "privacy-check": "bun run scripts/privacy-check.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.12",
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "bun": ">=1.3.0"
+  }
+}
