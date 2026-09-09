@@ -5,6 +5,10 @@ daemon. A small manifest maps a Claude session UUID to a Codex owner task and a
 Git common directory. Manifests contain no prompt, transcript, reasoning,
 credential, or environment value.
 
+The owner can be a Codex desktop task. The bridge uses the local `codex queue`
+command only as its delivery transport into that task; the owner does not need
+to run in a terminal.
+
 The bridge does not persist prompts. Claude Code's native background CLI does,
 however, require the prompt as a positional argument, so a same-user process may
 briefly observe it in the process list. Task prompts must not contain secrets.

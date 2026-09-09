@@ -29,7 +29,8 @@ transcripts, sends telemetry, or creates tasks on its own.
 - [Bun](https://bun.sh/)
 - Git
 - Claude Code with background agents and hooks
-- Codex CLI with `codex queue`
+- Codex desktop app or CLI installation that provides the local `codex queue`
+  command
 
 ## Install
 
