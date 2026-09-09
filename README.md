@@ -3,6 +3,9 @@
 A small local bridge for using Codex as the owner/reviewer while Claude Code
 workers implement tasks in native isolated worktrees.
 
+Built for local AI-agent orchestration, multi-agent coding workflows, and
+structured Claude Code → OpenAI Codex handoffs without adding a hosted service.
+
 It does not run a scheduler or hosted service. Claude owns worker sessions,
 worktrees, logs, and execution; Codex owns review and integration; Git remains
 the source of truth for code state.

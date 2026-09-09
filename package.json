@@ -2,6 +2,16 @@
   "name": "claude-codex-bridge",
   "version": "0.1.0",
   "description": "Route structured Claude Code worker handovers to a Codex owner task.",
+  "keywords": [
+    "claude-code",
+    "openai-codex",
+    "ai-agents",
+    "coding-agents",
+    "agent-orchestration",
+    "multi-agent",
+    "developer-tools",
+    "git-worktree"
+  ],
   "repository": "github:knakul853/claude-codex-bridge",
   "homepage": "https://github.com/knakul853/claude-codex-bridge#readme",
   "bugs": "https://github.com/knakul853/claude-codex-bridge/issues",
