@@ -117,6 +117,14 @@ export async function writeManifest(value: BridgeManifest): Promise<string> {
   return path;
 }
 
+export async function saveManifest(value: BridgeManifest): Promise<string> {
+  const manifest = parseManifest(value);
+  await ensurePrivateDirectory(stateRoot(manifest.gitCommonDir));
+  const path = manifestPath(manifest.gitCommonDir, manifest.sessionId);
+  await atomicWrite(path, manifest);
+  return path;
+}
+
 export async function loadManifest(
   gitCommonDir: string,
   sessionId: string,

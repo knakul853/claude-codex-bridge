@@ -6,10 +6,11 @@ import {
   parseSessionId,
 } from "./contracts";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
+import { type RepositoryState, readRepositoryState } from "./repository";
+import { redactText, truncateText } from "./safety";
 import { claimDelivery, loadManifest, settleDelivery } from "./state";
 
 const OWNER_MESSAGE_LIMIT_BYTES = 8_000;
-const CHANGED_FILE_LIMIT = 40;
 
 type HookName = "Stop" | "StopFailure";
 
@@ -22,17 +23,8 @@ export interface HookInput {
   error?: string;
 }
 
-interface GitState {
-  commonDir: string;
-  repository: string;
-  branch: string;
-  head: string;
-  clean: boolean;
-  changedFiles: string[];
-}
-
 export interface HookDependencies {
-  gitState(cwd: string): Promise<GitState>;
+  gitState(cwd: string): Promise<RepositoryState>;
   loadManifest(
     commonDir: string,
     sessionId: string,
@@ -101,28 +93,6 @@ function samePath(left: string, right: string): boolean {
   return resolve(left) === resolve(right);
 }
 
-function redacted(value: string): string {
-  return value
-    .replace(/\bBearer\s+[^\s]+/gi, "Bearer [redacted]")
-    .replace(
-      /\b(?:[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY))\s*[=:]\s*[^\s]+/gi,
-      "[redacted]",
-    )
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, "[redacted]");
-}
-
-function truncated(value: string, maxBytes: number): string {
-  const encoder = new TextEncoder();
-  if (encoder.encode(value).byteLength <= maxBytes) return value;
-  let end = Math.min(value.length, maxBytes);
-  while (
-    end > 0 &&
-    encoder.encode(value.slice(0, end)).byteLength > maxBytes - 3
-  )
-    end -= 1;
-  return `${value.slice(0, end)}...`;
-}
-
 function eventId(input: HookInput): string {
   const hash = new Bun.CryptoHasher("sha256");
   hash.update(input.session_id);
@@ -140,7 +110,7 @@ function notification(input: {
   handover?: AgentHandover;
   runtimeFailure?: string;
   eventId: string;
-  git: GitState;
+  git: RepositoryState;
 }): string {
   const disposition =
     input.handover?.disposition ??
@@ -155,21 +125,22 @@ function notification(input: {
     `session_id: ${JSON.stringify(input.manifest.sessionId)}`,
     `name: ${JSON.stringify(input.manifest.name ?? "Claude worker")}`,
     `disposition: ${disposition}`,
-    `repository: ${JSON.stringify(input.git.repository)}`,
+    `repository: ${JSON.stringify(basename(input.git.root))}`,
+    `worktree: ${JSON.stringify(input.git.root)}`,
     `branch: ${JSON.stringify(input.git.branch)}`,
     `head: ${JSON.stringify(input.git.head)}`,
     `working_tree: ${input.git.clean ? "clean" : "dirty"}`,
     `changed_files: ${JSON.stringify(input.git.changedFiles)}`,
     "untrusted_summary_json:",
-    JSON.stringify(redacted(summary)),
+    JSON.stringify(redactText(summary)),
   ];
-  return truncated(lines.join("\n"), OWNER_MESSAGE_LIMIT_BYTES);
+  return truncateText(lines.join("\n"), OWNER_MESSAGE_LIMIT_BYTES);
 }
 
 async function deliver(
   input: HookInput,
   manifest: BridgeManifest,
-  git: GitState,
+  git: RepositoryState,
   message: string,
   deps: HookDependencies,
 ): Promise<HookResult> {
@@ -245,46 +216,13 @@ export async function handleHook(
   );
 }
 
-async function gitState(
-  cwd: string,
-  process: ProcessRunner,
-): Promise<GitState> {
-  const [common, root, branch, head, status] = await Promise.all([
-    process.run([
-      "git",
-      "-C",
-      cwd,
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-common-dir",
-    ]),
-    process.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"]),
-    process.run(["git", "-C", cwd, "branch", "--show-current"]),
-    process.run(["git", "-C", cwd, "rev-parse", "HEAD"]),
-    process.run(["git", "-C", cwd, "status", "--porcelain"]),
-  ]);
-  const changedFiles = status.stdout
-    .split("\n")
-    .filter(Boolean)
-    .slice(0, CHANGED_FILE_LIMIT)
-    .map((line) => truncated(line.slice(3), 256));
-  return {
-    commonDir: common.stdout.trim(),
-    repository: basename(root.stdout.trim()),
-    branch: branch.stdout.trim() || "detached",
-    head: head.stdout.trim(),
-    clean: status.stdout.trim().length === 0,
-    changedFiles,
-  };
-}
-
 export async function runHook(
   value: unknown,
   process: ProcessRunner = nativeProcessRunner,
 ): Promise<HookResult> {
   const input = parseHookInput(value);
   return handleHook(input, {
-    gitState: (cwd) => gitState(cwd, process),
+    gitState: (cwd) => readRepositoryState(cwd, process),
     loadManifest,
     claimDelivery,
     settleDelivery,

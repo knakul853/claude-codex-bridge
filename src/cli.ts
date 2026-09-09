@@ -6,11 +6,12 @@ import {
   continueJob,
   forgetJob,
   jobStatus,
-  type RepositoryState,
+  requestReview,
   startJob,
 } from "./claude";
 import { runHook } from "./hook";
 import { nativeProcessRunner } from "./process";
+import { readRepositoryState } from "./repository";
 import {
   installBridgeHooks,
   readSettings,
@@ -38,28 +39,6 @@ function required(name: string): string {
   return value;
 }
 
-async function repository(cwd = process.cwd()): Promise<RepositoryState> {
-  const [root, common, branch, status] = await Promise.all([
-    nativeProcessRunner.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"]),
-    nativeProcessRunner.run([
-      "git",
-      "-C",
-      cwd,
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-common-dir",
-    ]),
-    nativeProcessRunner.run(["git", "-C", cwd, "branch", "--show-current"]),
-    nativeProcessRunner.run(["git", "-C", cwd, "status", "--porcelain"]),
-  ]);
-  return {
-    root: resolve(root.stdout.trim()),
-    commonDir: resolve(common.stdout.trim()),
-    branch: branch.stdout.trim(),
-    clean: status.stdout.trim().length === 0,
-  };
-}
-
 async function prompt(): Promise<string> {
   const path = option("--prompt-file");
   if (path) return readFile(resolve(path), "utf8");
@@ -75,6 +54,7 @@ async function doctor(): Promise<Record<string, string>> {
     ["git", ["git", "--version"]],
     ["claude", ["claude", "--version"]],
     ["codex", ["codex", "queue", "--help"]],
+    ["codex-exec", ["codex", "exec", "--help"]],
   ] as const) {
     const result = await nativeProcessRunner.run([...argv]);
     checks[name] = result.stdout.trim().split("\n")[0] || "available";
@@ -83,7 +63,12 @@ async function doctor(): Promise<Record<string, string>> {
 }
 
 async function settingsPath(): Promise<string> {
-  return join((await repository()).root, ".claude", "settings.json");
+  const root = await nativeProcessRunner.run([
+    "git",
+    "rev-parse",
+    "--show-toplevel",
+  ]);
+  return join(resolve(root.stdout.trim()), ".claude", "settings.json");
 }
 
 async function main(): Promise<void> {
@@ -116,7 +101,7 @@ async function main(): Promise<void> {
     process.stdout.write(`${JSON.stringify({ ok: true, settings: path })}\n`);
     return;
   }
-  const repo = await repository();
+  const repo = await readRepositoryState();
   if (command === "start") {
     const name = option("--name");
     const manifest = await startJob({
@@ -129,6 +114,18 @@ async function main(): Promise<void> {
     return;
   }
   const sessionId = required("--session");
+  if (command === "review") {
+    const ownerThreadId = option("--owner-thread");
+    const result = await requestReview({
+      sessionId,
+      instructions: await prompt(),
+      repository: repo,
+      ...(ownerThreadId ? { ownerThreadId } : {}),
+      newCodexTask: Bun.argv.includes("--new-codex-task"),
+    });
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
   if (command === "continue") {
     await continueJob({
       sessionId,
@@ -150,7 +147,7 @@ async function main(): Promise<void> {
     return;
   }
   throw new CliError(
-    "usage: claude-codex-bridge <doctor|install-hooks|uninstall-hooks|start|continue|status|forget>",
+    "usage: claude-codex-bridge <doctor|install-hooks|uninstall-hooks|start|review|continue|status|forget>",
     2,
   );
 }

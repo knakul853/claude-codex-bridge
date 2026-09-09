@@ -1,6 +1,6 @@
 {
   "name": "claude-codex-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Route structured Claude Code worker handovers to a Codex owner task.",
   "keywords": [
     "claude-code",

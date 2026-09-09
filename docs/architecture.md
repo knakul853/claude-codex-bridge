@@ -9,6 +9,15 @@ The owner can be a Codex desktop task. The bridge uses the local `codex queue`
 command only as its delivery transport into that task; the owner does not need
 to run in a terminal.
 
+Claude-originated work uses the same route in reverse. `review --owner-thread`
+targets an existing task asynchronously. `review --new-codex-task` runs the
+first review to completion through Codex CLI, records its `thread.started`
+identity, and returns the review directly to its caller; that durable task is
+also visible in Codex Desktop. The manifest records the selected task, so later
+corrections can resume the same Claude session and handovers return to the same
+reviewer. The bridge runs no daemon of its own.
+The created task inherits the user's Codex approval and sandbox configuration.
+
 The bridge does not persist prompts. Claude Code's native background CLI does,
 however, require the prompt as a positional argument, so a same-user process may
 briefly observe it in the process list. Task prompts must not contain secrets.

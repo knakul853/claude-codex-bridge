@@ -17,11 +17,13 @@ the source of truth for code state.
 - Reads branch, commit, cleanliness, and changed files from Git rather than
   trusting model prose.
 - Continues the same Claude session after owner feedback.
+- Lets Claude request review in an existing or newly created Codex task.
 - Suppresses duplicate notifications and never automatically retries an
   uncertain Codex delivery.
 
 It never merges, pushes, posts PR comments, edits boards, stores prompts or
-transcripts, sends telemetry, or creates tasks on its own.
+transcripts, or sends telemetry. It creates a Codex task only when explicitly
+invoked with `--new-codex-task`.
 
 ## Requirements
 
@@ -30,7 +32,7 @@ transcripts, sends telemetry, or creates tasks on its own.
 - Git
 - Claude Code with background agents and hooks
 - Codex desktop app or CLI installation that provides the local `codex queue`
-  command
+  and `codex exec` commands
 
 ## Install
 
@@ -77,6 +79,25 @@ claude-codex-bridge status --session <claude-session-uuid>
 printf '%s' 'Address the owner feedback and re-verify.' |
   claude-codex-bridge continue --session <claude-session-uuid>
 ```
+
+Claude can request Codex review for its current session. Choose an existing
+Codex task, or create a new durable task in Codex Desktop:
+
+```sh
+printf '%s' 'Review this work and return corrections to the same Claude session.' |
+  claude-codex-bridge review --session <claude-session-uuid> --owner-thread <codex-task-id>
+
+printf '%s' 'Review this work.' |
+  claude-codex-bridge review --session <claude-session-uuid> --new-codex-task
+```
+
+After the first request, omit both routing options to reuse the recorded Codex
+task. Codex can send corrections back with `continue`; the next Claude handover
+returns to that same Codex task.
+
+Creating a task waits for its first Codex review and prints that response, so a
+Claude session invoking the command can use the feedback immediately. Reusing
+an existing Codex task queues the request asynchronously.
 
 After the native session and worktree have been handled, remove only the
 bridge's routing state:

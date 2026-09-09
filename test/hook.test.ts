@@ -23,7 +23,7 @@ function dependencies(overrides: Partial<HookDependencies> = {}): {
     deps: {
       gitState: async () => ({
         commonDir: "/repo/.git",
-        repository: "example",
+        root: "/repo/example",
         branch: "codex/fix",
         head: "a".repeat(40),
         clean: false,

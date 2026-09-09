@@ -46,7 +46,14 @@ test("starts a native isolated Claude worker and persists routing metadata only"
     ownerThreadId: "owner-thread",
     name: "Review replay safety",
     prompt: "Fix the replay bug",
-    repository: { root, commonDir, branch: "dev", clean: true },
+    repository: {
+      root,
+      commonDir,
+      branch: "dev",
+      head: "a".repeat(40),
+      clean: true,
+      changedFiles: [],
+    },
     process: runner,
     now: () => "2026-09-09T00:00:00.000Z",
   });
@@ -78,7 +85,9 @@ test("refuses dirty or detached starts before launching Claude", async () => {
     root: "/repo",
     commonDir: "/repo/.git",
     branch: "dev",
+    head: "a".repeat(40),
     clean: false,
+    changedFiles: [],
   };
   await expect(
     startJob({ ownerThreadId: "owner", prompt: "work", repository, process }),
