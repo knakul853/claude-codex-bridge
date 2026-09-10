@@ -1,4 +1,5 @@
 import type { CodexReviewClient } from "./codex";
+import type { ProcessRunner } from "./process";
 import {
   type CodexThread,
   readAssistantMessages,
@@ -9,6 +10,7 @@ import {
 export interface SendTarget {
   thread?: string;
   project?: string;
+  root?: string;
 }
 
 export function resolveThread(
@@ -45,6 +47,46 @@ export interface SendResult {
   label: string;
   reply?: string;
   timedOut: boolean;
+}
+
+// codex exec would create a thread in the CLI, which has neither the desktop
+// app's computer use nor the user's logged-in browser sessions. The desktop app
+// registers the codex:// scheme, and threads/new opens a composer prefilled with
+// the prompt. It deliberately does not auto-send: a human approves the message
+// before a computer-use agent acts on it, and an unsent thread is not persisted,
+// so the caller has to watch for the thread to appear.
+export function desktopThreadUrl(workspace: string, message: string): string {
+  const params = new URLSearchParams({ workspace, prompt: message });
+  return `codex://threads/new?${params.toString()}`;
+}
+
+export interface OpenedThread {
+  url: string;
+  workspace: string;
+  project: string;
+  awaitingSend: true;
+}
+
+export async function openThreadInDesktop(
+  store: ThreadStore,
+  process: ProcessRunner,
+  target: SendTarget,
+  message: string,
+): Promise<OpenedThread> {
+  if (!target.project)
+    throw new Error("--project is required to open a thread");
+  const project = resolveProject(store.projects(), target.project);
+  const root = target.root ?? project.roots[0];
+  if (!root)
+    throw new Error(`project ${project.name} has no root directory configured`);
+  if (target.root && !project.roots.includes(target.root)) {
+    throw new Error(
+      `${target.root} is not a root of ${project.name}. roots: ${project.roots.join(", ")}`,
+    );
+  }
+  const url = desktopThreadUrl(root, message);
+  await process.run(["open", url]);
+  return { url, workspace: root, project: project.name, awaitingSend: true };
 }
 
 // The queue call returns as soon as Codex accepts the message, so a reply is

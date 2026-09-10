@@ -13,14 +13,18 @@ import { NativeCodexReviewClient } from "./codex";
 import { runHook } from "./hook";
 import { nativeProcessRunner } from "./process";
 import { readRepositoryState } from "./repository";
-import { sendToThread } from "./send";
+import { openThreadInDesktop, sendToThread } from "./send";
 import {
   installBridgeHooks,
   readSettings,
   uninstallBridgeHooks,
   writeSettings,
 } from "./settings";
-import { resolveProject, SqliteThreadStore } from "./threads";
+import {
+  readAssistantMessages,
+  resolveProject,
+  SqliteThreadStore,
+} from "./threads";
 
 class CliError extends Error {
   constructor(
@@ -120,11 +124,48 @@ async function main(): Promise<void> {
     process.stdout.write(`${JSON.stringify({ threads }, null, 2)}\n`);
     return;
   }
+  if (command === "read") {
+    const store = SqliteThreadStore.open();
+    const id = required("--thread");
+    const match = store.threads({ limit: 1_000 }).find((t) => t.id === id);
+    if (!match) throw new CliError(`no codex thread ${id}`, 2);
+    const last = Number(option("--last") ?? 1);
+    const messages = match.rolloutPath
+      ? await readAssistantMessages(match.rolloutPath)
+      : [];
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          threadId: match.id,
+          label: match.label,
+          total: messages.length,
+          messages: messages.slice(-last).map((m) => m.text),
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return;
+  }
   if (command === "send") {
     const message = option("--message") ?? (await prompt());
     const thread = option("--thread");
     const project = option("--project");
     const shouldWait = Bun.argv.includes("--wait");
+    const root = option("--root");
+    if (Bun.argv.includes("--new")) {
+      const opened = await openThreadInDesktop(
+        SqliteThreadStore.open(),
+        nativeProcessRunner,
+        {
+          ...(project ? { project } : {}),
+          ...(root ? { root } : {}),
+        },
+        message,
+      );
+      process.stdout.write(`${JSON.stringify(opened, null, 2)}\n`);
+      return;
+    }
     const result = await sendToThread(
       SqliteThreadStore.open(),
       new NativeCodexReviewClient(),
@@ -186,7 +227,7 @@ async function main(): Promise<void> {
     return;
   }
   throw new CliError(
-    "usage: claude-codex-bridge <doctor|projects|threads|send|install-hooks|uninstall-hooks|start|review|continue|status|forget>",
+    "usage: claude-codex-bridge <doctor|projects|threads|send|read|install-hooks|uninstall-hooks|start|review|continue|status|forget>",
     2,
   );
 }

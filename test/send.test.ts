@@ -3,7 +3,12 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodexReviewClient, CreatedCodexTask } from "../src/codex";
-import { resolveThread, sendToThread } from "../src/send";
+import {
+  desktopThreadUrl,
+  openThreadInDesktop,
+  resolveThread,
+  sendToThread,
+} from "../src/send";
 import type { CodexThread, ThreadStore } from "../src/threads";
 import { readAssistantMessages, resolveProject } from "../src/threads";
 
@@ -171,5 +176,52 @@ describe("sendToThread", () => {
     );
     expect(result.timedOut).toBe(true);
     expect(result.reply).toBeUndefined();
+  });
+});
+
+describe("openThreadInDesktop", () => {
+  const opener = () => {
+    const opened: string[][] = [];
+    return {
+      opened,
+      run: async (argv: string[]) => {
+        opened.push(argv);
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    };
+  };
+
+  test("opens a desktop composer prefilled with the prompt", async () => {
+    const runner = opener();
+    const result = await openThreadInDesktop(
+      store([]),
+      runner,
+      { project: "aurora-nuclei" },
+      "run the QA brief",
+    );
+    expect(runner.opened[0]?.[0]).toBe("open");
+    expect(result.workspace).toBe("/repo/a");
+    expect(result.awaitingSend).toBe(true);
+    const url = new URL(runner.opened[0]?.[1] ?? "");
+    expect(url.protocol).toBe("codex:");
+    expect(url.searchParams.get("workspace")).toBe("/repo/a");
+    expect(url.searchParams.get("prompt")).toBe("run the QA brief");
+  });
+
+  test("encodes newlines and spaces in the prompt", () => {
+    const url = desktopThreadUrl("/repo/a", "line one\nline two");
+    expect(url).toContain("prompt=line+one%0Aline+two");
+    expect(new URL(url).searchParams.get("prompt")).toBe("line one\nline two");
+  });
+
+  test("rejects a root outside the project", async () => {
+    await expect(
+      openThreadInDesktop(
+        store([]),
+        opener(),
+        { project: "aurora-nuclei", root: "/repo/c" },
+        "brief",
+      ),
+    ).rejects.toThrow(/not a root of aurora-nuclei/);
   });
 });
