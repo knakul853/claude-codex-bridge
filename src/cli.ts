@@ -9,15 +9,18 @@ import {
   requestReview,
   startJob,
 } from "./claude";
+import { NativeCodexReviewClient } from "./codex";
 import { runHook } from "./hook";
 import { nativeProcessRunner } from "./process";
 import { readRepositoryState } from "./repository";
+import { sendToThread } from "./send";
 import {
   installBridgeHooks,
   readSettings,
   uninstallBridgeHooks,
   writeSettings,
 } from "./settings";
+import { resolveProject, SqliteThreadStore } from "./threads";
 
 class CliError extends Error {
   constructor(
@@ -101,6 +104,42 @@ async function main(): Promise<void> {
     process.stdout.write(`${JSON.stringify({ ok: true, settings: path })}\n`);
     return;
   }
+  if (command === "projects") {
+    const projects = SqliteThreadStore.open().projects();
+    process.stdout.write(`${JSON.stringify({ projects }, null, 2)}\n`);
+    return;
+  }
+  if (command === "threads") {
+    const store = SqliteThreadStore.open();
+    const name = option("--project");
+    const roots = name
+      ? resolveProject(store.projects(), name).roots
+      : undefined;
+    const limit = Number(option("--limit") ?? 20);
+    const threads = store.threads({ ...(roots ? { roots } : {}), limit });
+    process.stdout.write(`${JSON.stringify({ threads }, null, 2)}\n`);
+    return;
+  }
+  if (command === "send") {
+    const message = option("--message") ?? (await prompt());
+    const thread = option("--thread");
+    const project = option("--project");
+    const shouldWait = Bun.argv.includes("--wait");
+    const result = await sendToThread(
+      SqliteThreadStore.open(),
+      new NativeCodexReviewClient(),
+      { ...(thread ? { thread } : {}), ...(project ? { project } : {}) },
+      message,
+      shouldWait
+        ? {
+            timeoutMs: Number(option("--timeout") ?? 900) * 1_000,
+            pollMs: Number(option("--poll") ?? 5) * 1_000,
+          }
+        : undefined,
+    );
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
   const repo = await readRepositoryState();
   if (command === "start") {
     const name = option("--name");
@@ -147,7 +186,7 @@ async function main(): Promise<void> {
     return;
   }
   throw new CliError(
-    "usage: claude-codex-bridge <doctor|install-hooks|uninstall-hooks|start|review|continue|status|forget>",
+    "usage: claude-codex-bridge <doctor|projects|threads|send|install-hooks|uninstall-hooks|start|review|continue|status|forget>",
     2,
   );
 }
