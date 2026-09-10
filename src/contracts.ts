@@ -3,6 +3,9 @@ const IDENTIFIER_LIMIT_BYTES = 128;
 
 export const SESSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// Codex thread ids are UUIDv7, whose version nibble SESSION_ID_PATTERN rejects.
+export const THREAD_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const HANDOVER_DISPOSITIONS = [
   "ready_for_review",
   "needs_owner",
@@ -32,6 +35,21 @@ export interface DeliveryRecord {
   eventId: string;
   sessionId: string;
   status: DeliveryStatus;
+  updatedAt: string;
+}
+
+/**
+ * A collaboration between one Claude session and one Codex thread. Either side
+ * may be absent while the pairing is still one-sided.
+ */
+export interface PeerLink {
+  schemaVersion: 1;
+  id: string;
+  cwd: string;
+  claudeSessionId?: string;
+  codexThreadId?: string;
+  label?: string;
+  createdAt: string;
   updatedAt: string;
 }
 
@@ -157,6 +175,55 @@ export function parseDeliveryRecord(value: unknown): DeliveryRecord {
     status: record.status as DeliveryStatus,
     updatedAt: boundedString(record.updatedAt, "updated time"),
   };
+}
+
+// codex queue accepts a session UUID or an exact session name, so a thread
+// reference is validated as a bounded label rather than forced into a UUID.
+export function parseThreadRef(value: unknown): string {
+  return boundedString(value, "codex thread reference");
+}
+
+export function parsePeerLink(value: unknown): PeerLink {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("peer link must be an object");
+  }
+  const record = value as Record<string, unknown>;
+  const allowed = [
+    "claudeSessionId",
+    "codexThreadId",
+    "createdAt",
+    "cwd",
+    "id",
+    "label",
+    "schemaVersion",
+    "updatedAt",
+  ];
+  if (Object.keys(record).some((key) => !allowed.includes(key))) {
+    throw new Error("peer link contains an unknown field");
+  }
+  if (record.schemaVersion !== 1) {
+    throw new Error("peer link schema version is unsupported");
+  }
+  const link: PeerLink = {
+    schemaVersion: 1,
+    id: boundedString(record.id, "peer id"),
+    cwd: boundedString(record.cwd, "peer directory", 1_024),
+    createdAt: boundedString(record.createdAt, "creation time"),
+    updatedAt: boundedString(record.updatedAt, "updated time"),
+  };
+  if (record.claudeSessionId !== undefined) {
+    link.claudeSessionId = parseSessionId(record.claudeSessionId);
+  }
+  if (record.codexThreadId !== undefined) {
+    link.codexThreadId = parseThreadRef(record.codexThreadId);
+  }
+  if (record.label !== undefined) {
+    link.label = boundedString(record.label, "label", 128);
+  }
+  if (!link.claudeSessionId && !link.codexThreadId) {
+    throw new Error("peer link must name a Claude session or a Codex thread");
+  }
+  return link;
 }
 
 export const HANDOVER_INSTRUCTION = `Finish your final response with exactly one block:

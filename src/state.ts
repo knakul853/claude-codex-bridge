@@ -1,15 +1,5 @@
 import { constants } from "node:fs";
-import {
-  chmod,
-  link,
-  lstat,
-  mkdir,
-  open,
-  readFile,
-  rename,
-  rm,
-  unlink,
-} from "node:fs/promises";
+import { open, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   type BridgeManifest,
@@ -19,6 +9,13 @@ import {
   parseManifest,
   parseSessionId,
 } from "./contracts";
+import {
+  absent,
+  atomicCreate,
+  atomicWrite,
+  ensurePrivateDirectory,
+  safeRead,
+} from "./store";
 
 const STATE_DIR = "claude-codex-bridge";
 
@@ -38,75 +35,6 @@ function deliveryPath(gitCommonDir: string, eventId: string): string {
   if (!/^[0-9a-f]{64}$/.test(eventId))
     throw new Error("event id must be a SHA-256 hex value");
   return join(stateRoot(gitCommonDir), "deliveries", `${eventId}.json`);
-}
-
-async function ensurePrivateDirectory(path: string): Promise<void> {
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  const info = await lstat(path);
-  if (!info.isDirectory() || info.isSymbolicLink()) {
-    throw new Error("bridge state path must be a real directory");
-  }
-  await chmod(path, 0o700);
-}
-
-async function atomicWrite(path: string, value: unknown): Promise<void> {
-  await ensurePrivateDirectory(dirname(path));
-  const temporary = `${path}.${crypto.randomUUID()}.tmp`;
-  const handle = await open(
-    temporary,
-    constants.O_CREAT |
-      constants.O_EXCL |
-      constants.O_WRONLY |
-      constants.O_NOFOLLOW,
-    0o600,
-  );
-  try {
-    await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await rename(temporary, path);
-  await chmod(path, 0o600);
-}
-
-async function atomicCreate(path: string, value: unknown): Promise<void> {
-  await ensurePrivateDirectory(dirname(path));
-  const temporary = `${path}.${crypto.randomUUID()}.tmp`;
-  const handle = await open(
-    temporary,
-    constants.O_CREAT |
-      constants.O_EXCL |
-      constants.O_WRONLY |
-      constants.O_NOFOLLOW,
-    0o600,
-  );
-  try {
-    await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  try {
-    await link(temporary, path);
-    await chmod(path, 0o600);
-  } finally {
-    await unlink(temporary).catch((error: unknown) => {
-      if (!absent(error)) throw error;
-    });
-  }
-}
-
-async function safeRead(path: string): Promise<string> {
-  const info = await lstat(path);
-  if (!info.isFile() || info.isSymbolicLink()) {
-    throw new Error("bridge state file must be a regular file");
-  }
-  return readFile(path, "utf8");
-}
-
-function absent(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 export async function writeManifest(value: BridgeManifest): Promise<string> {

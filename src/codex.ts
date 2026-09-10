@@ -1,11 +1,9 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { THREAD_ID_PATTERN } from "./contracts";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
 import { redactText, truncateText } from "./safety";
-
-const THREAD_ID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface CreatedCodexTask {
   threadId: string;
