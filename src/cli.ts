@@ -24,7 +24,9 @@ import {
 import {
   readAssistantMessages,
   resolveProject,
+  rolloutSize,
   SqliteThreadStore,
+  scanAssistantMessages,
 } from "./threads";
 
 const USAGE = `claude-codex-bridge <command>
@@ -188,24 +190,24 @@ async function main(): Promise<void> {
     const id = required("--thread");
     const match = store.threads({ limit: 1_000 }).find((t) => t.id === id);
     if (!match) throw new CliError(`no codex thread ${id}`, 2);
-    const baseline =
+    const fromOffset =
       option("--since") !== undefined
         ? Number(option("--since"))
         : match.rolloutPath
-          ? (await readAssistantMessages(match.rolloutPath)).length
+          ? rolloutSize(match.rolloutPath)
           : 0;
     const result = await watchForReply(
       match,
       {
         watch: (path, onChange) => watchFile(path, () => onChange()),
-        read: readAssistantMessages,
+        scan: scanAssistantMessages,
         timer: (ms, fire) => {
           const handle = setTimeout(fire, ms);
           return { cancel: () => clearTimeout(handle) };
         },
       },
       Number(option("--timeout") ?? 1800) * 1_000,
-      baseline,
+      fromOffset,
     );
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     if (result.timedOut) process.exitCode = 3;

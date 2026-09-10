@@ -82,6 +82,7 @@ describe("readAssistantMessages", () => {
         }),
         "not json at all",
         assistantLine("second"),
+        "",
       ].join("\n"),
     );
     expect((await readAssistantMessages(path)).map((m) => m.text)).toEqual([
@@ -310,46 +311,94 @@ describe("auto send", () => {
 });
 
 describe("watchForReply", () => {
-  const deps = (
-    reads: AssistantMessage[][],
-  ): WatchDeps & { closed: () => boolean; cancelled: () => boolean } => {
-    let closed = false;
-    let cancelled = false;
-    let call = 0;
-    return {
-      closed: () => closed,
-      cancelled: () => cancelled,
-      watch: (_path, onChange) => {
-        queueMicrotask(() => onChange());
-        return {
-          close: () => {
-            closed = true;
-          },
-        };
-      },
-      read: async () => reads[Math.min(call++, reads.length - 1)] ?? [],
-      timer: () => ({
-        cancel: () => {
-          cancelled = true;
-        },
-      }),
-    };
-  };
-
   const msg = (text: string): AssistantMessage => ({ text, index: 1 });
 
-  test("resolves with the new turn and tears down the watcher", async () => {
-    const d = deps([[msg("old")], [msg("old"), msg("new")]]);
+  test("returns a turn appended after the offset it started from", async () => {
+    let closed = false;
+    let cancelled = false;
     const result = await watchForReply(
       thread({ rolloutPath: "/tmp/r.jsonl" }),
-      d,
+      {
+        watch: (_p, onChange) => {
+          queueMicrotask(() => onChange());
+          return {
+            close: () => {
+              closed = true;
+            },
+          };
+        },
+        scan: async (_p, from) =>
+          from === 100
+            ? { messages: [], endOffset: 100 }
+            : { messages: [msg("fresh")], endOffset: 200 },
+        timer: () => ({
+          cancel: () => {
+            cancelled = true;
+          },
+        }),
+      },
       1_000,
-      1,
+      50,
     );
-    expect(result.reply).toBe("new");
+    expect(result.reply).toBe("fresh");
     expect(result.timedOut).toBe(false);
-    expect(d.closed()).toBe(true);
-    expect(d.cancelled()).toBe(true);
+    expect(closed).toBe(true);
+    expect(cancelled).toBe(true);
+  });
+
+  // The bug this replaced: a fixed tail window drops old turns as new ones
+  // arrive, so a count never grows and the wait hangs while Codex is answering.
+  test("does not depend on the number of turns in the window", async () => {
+    let call = 0;
+    const result = await watchForReply(
+      thread({ rolloutPath: "/tmp/r.jsonl" }),
+      {
+        watch: (_p, onChange) => {
+          queueMicrotask(() => onChange());
+          return { close: () => {} };
+        },
+        scan: async () => {
+          call += 1;
+          // Same count every time, but the second scan contains a new turn.
+          return call === 1
+            ? { messages: [], endOffset: 10 }
+            : { messages: [msg("appended")], endOffset: 20 };
+        },
+        timer: () => ({ cancel: () => {} }),
+      },
+      1_000,
+      0,
+    );
+    expect(result.reply).toBe("appended");
+  });
+
+  test("advances the offset so the same bytes are not re-read", async () => {
+    const offsets: number[] = [];
+    let fire: (() => void) | undefined;
+    const pending = watchForReply(
+      thread({ rolloutPath: "/tmp/r.jsonl" }),
+      {
+        watch: (_p, onChange) => {
+          fire = onChange;
+          return { close: () => {} };
+        },
+        scan: async (_p, from) => {
+          offsets.push(from);
+          return offsets.length < 3
+            ? { messages: [], endOffset: from + 10 }
+            : { messages: [msg("done")], endOffset: from + 10 };
+        },
+        timer: () => ({ cancel: () => {} }),
+      },
+      1_000,
+      0,
+    );
+    await Promise.resolve();
+    fire?.();
+    await Promise.resolve();
+    fire?.();
+    await pending;
+    expect(offsets).toEqual([0, 10, 20]);
   });
 
   test("reports a timeout when the deadline fires first", async () => {
@@ -357,21 +406,29 @@ describe("watchForReply", () => {
       thread({ rolloutPath: "/tmp/r.jsonl" }),
       {
         watch: () => ({ close: () => {} }),
-        read: async () => [msg("old")],
-        timer: (_ms, fire) => {
-          queueMicrotask(fire);
+        scan: async (_p, from) => ({ messages: [], endOffset: from }),
+        timer: (_ms, fireNow) => {
+          queueMicrotask(fireNow);
           return { cancel: () => {} };
         },
       },
       1,
-      1,
+      0,
     );
     expect(result.timedOut).toBe(true);
-    expect(result.reply).toBeUndefined();
   });
 
   test("times out immediately for a thread with no rollout", async () => {
-    const result = await watchForReply(thread(), deps([[]]), 1_000, 0);
+    const result = await watchForReply(
+      thread(),
+      {
+        watch: () => ({ close: () => {} }),
+        scan: async (_p, from) => ({ messages: [], endOffset: from }),
+        timer: () => ({ cancel: () => {} }),
+      },
+      1_000,
+      0,
+    );
     expect(result.timedOut).toBe(true);
   });
 });

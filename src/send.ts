@@ -1,8 +1,8 @@
 import type { CodexReviewClient } from "./codex";
 import type { ProcessRunner } from "./process";
 import {
-  type AssistantMessage,
   type CodexThread,
+  type MessageScan,
   readAssistantMessages,
   resolveProject,
   type ThreadStore,
@@ -192,32 +192,35 @@ export async function sendToThread(
 
 export interface WatchDeps {
   watch: (path: string, onChange: () => void) => { close: () => void };
-  read: (path: string) => Promise<AssistantMessage[]>;
+  scan: (path: string, fromOffset: number) => Promise<MessageScan>;
   timer: (ms: number, fire: () => void) => { cancel: () => void };
 }
 
 export interface WatchResult {
   threadId: string;
   reply?: string;
-  total: number;
   timedOut: boolean;
 }
 
-// Blocks on filesystem events rather than a poll interval, so a caller can wait
-// on a Codex turn the way it would wait on any other process.
+// Resumes from a byte offset rather than comparing message counts: the rollout is
+// append-only and read through a window, so a count can stay level while Codex is
+// answering and a count-based wait never returns.
 export function watchForReply(
   thread: CodexThread,
   deps: WatchDeps,
   timeoutMs: number,
-  baseline: number,
+  fromOffset: number,
 ): Promise<WatchResult> {
   return new Promise<WatchResult>((resolve, reject) => {
     if (!thread.rolloutPath) {
-      resolve({ threadId: thread.id, total: 0, timedOut: true });
+      resolve({ threadId: thread.id, timedOut: true });
       return;
     }
     const path = thread.rolloutPath;
+    let offset = fromOffset;
     let settled = false;
+    let checking = false;
+    let changedWhileChecking = false;
     const finish = (result: WatchResult) => {
       if (settled) return;
       settled = true;
@@ -226,18 +229,35 @@ export function watchForReply(
       resolve(result);
     };
     const check = () => {
+      if (settled) return;
+      // A change arriving mid-scan must not be dropped: the watcher may never
+      // fire again if Codex has finished writing.
+      if (checking) {
+        changedWhileChecking = true;
+        return;
+      }
+      checking = true;
       deps
-        .read(path)
-        .then((messages) => {
-          if (messages.length <= baseline) return;
-          finish({
-            threadId: thread.id,
-            reply: messages[messages.length - 1]?.text,
-            total: messages.length,
-            timedOut: false,
-          });
+        .scan(path, offset)
+        .then((scan) => {
+          checking = false;
+          offset = scan.endOffset;
+          const latest = scan.messages[scan.messages.length - 1];
+          if (latest) {
+            finish({
+              threadId: thread.id,
+              reply: latest.text,
+              timedOut: false,
+            });
+            return;
+          }
+          if (changedWhileChecking) {
+            changedWhileChecking = false;
+            check();
+          }
         })
         .catch((error: unknown) => {
+          checking = false;
           if (settled) return;
           settled = true;
           watcher.close();
@@ -247,7 +267,7 @@ export function watchForReply(
     };
     const watcher = deps.watch(path, check);
     const timer = deps.timer(timeoutMs, () =>
-      finish({ threadId: thread.id, total: baseline, timedOut: true }),
+      finish({ threadId: thread.id, timedOut: true }),
     );
     check();
   });

@@ -137,49 +137,84 @@ export interface AssistantMessage {
   index: number;
 }
 
-// Rollouts are append-only JSONL and reach hundreds of megabytes, so read a
-// bounded window from the end rather than the whole file.
+export interface MessageScan {
+  messages: AssistantMessage[];
+  /** Byte offset to resume from; pass back to read only what was appended. */
+  endOffset: number;
+}
+
+// Rollouts are append-only JSONL and reach hundreds of megabytes. Reading a fixed
+// tail makes the message count useless for change detection: as the file grows old
+// turns leave the window as new ones enter, so the count can sit still while Codex
+// is answering. Callers watching for a reply must resume from a byte offset.
+export async function scanAssistantMessages(
+  rolloutPath: string,
+  fromOffset: number,
+): Promise<MessageScan> {
+  const handle = await open(rolloutPath, "r");
+  try {
+    const size = statSync(rolloutPath).size;
+    // A truncated or replaced file means the offset no longer refers to our data.
+    const start = fromOffset > size ? 0 : fromOffset;
+    if (start === size) return { messages: [], endOffset: size };
+    const buffer = Buffer.alloc(size - start);
+    await handle.read(buffer, 0, buffer.length, start);
+    const text = buffer.toString("utf8");
+    // A trailing partial line is re-read next time rather than parsed now.
+    const lastBreak = text.lastIndexOf("\n");
+    const complete = lastBreak === -1 ? "" : text.slice(0, lastBreak);
+    return {
+      messages: parseAssistantMessages(complete),
+      endOffset: lastBreak === -1 ? start : start + lastBreak + 1,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+export function parseAssistantMessages(text: string): AssistantMessage[] {
+  const messages: AssistantMessage[] = [];
+  let index = 0;
+  for (const line of text.split("\n")) {
+    index += 1;
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (event.type !== "response_item") continue;
+    const payload = event.payload as Record<string, unknown> | undefined;
+    if (!payload || payload.type !== "message" || payload.role !== "assistant")
+      continue;
+    const content = Array.isArray(payload.content) ? payload.content : [];
+    const body = content
+      .map((part) =>
+        typeof part === "object" && part && "text" in part
+          ? String((part as { text?: unknown }).text ?? "")
+          : "",
+      )
+      .join("")
+      .trim();
+    if (body) messages.push({ text: body, index });
+  }
+  return messages;
+}
+
+export function rolloutSize(rolloutPath: string): number {
+  return statSync(rolloutPath).size;
+}
+
+// Only for showing the most recent turns; the count is of the window read, not
+// of the thread. Never use it to detect that something new arrived.
 export async function readAssistantMessages(
   rolloutPath: string,
   tailBytes = 2_000_000,
 ): Promise<AssistantMessage[]> {
-  const handle = await open(rolloutPath, "r");
-  try {
-    const size = statSync(rolloutPath).size;
-    const start = Math.max(0, size - tailBytes);
-    const buffer = Buffer.alloc(size - start);
-    await handle.read(buffer, 0, buffer.length, start);
-    const messages: AssistantMessage[] = [];
-    let index = 0;
-    for (const line of buffer.toString("utf8").split("\n")) {
-      index += 1;
-      let event: Record<string, unknown>;
-      try {
-        event = JSON.parse(line) as Record<string, unknown>;
-      } catch {
-        continue;
-      }
-      if (event.type !== "response_item") continue;
-      const payload = event.payload as Record<string, unknown> | undefined;
-      if (
-        !payload ||
-        payload.type !== "message" ||
-        payload.role !== "assistant"
-      )
-        continue;
-      const content = Array.isArray(payload.content) ? payload.content : [];
-      const text = content
-        .map((part) =>
-          typeof part === "object" && part && "text" in part
-            ? String((part as { text?: unknown }).text ?? "")
-            : "",
-        )
-        .join("")
-        .trim();
-      if (text) messages.push({ text, index });
-    }
-    return messages;
-  } finally {
-    await handle.close();
-  }
+  const size = statSync(rolloutPath).size;
+  const { messages } = await scanAssistantMessages(
+    rolloutPath,
+    Math.max(0, size - tailBytes),
+  );
+  return messages;
 }

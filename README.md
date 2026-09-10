@@ -129,6 +129,11 @@ claude-codex-bridge watch --thread <uuid>             # block until the next tur
 nothing while it thinks and returns the moment it answers. Exit code 3 means the
 timeout was reached. Run it as a background job and let it wake you.
 
+It resumes from a byte offset rather than counting turns. A rollout is read through
+a window, so as the file grows old turns leave it as new ones arrive and the count
+can sit still while Codex is answering — `read`'s count is of the window, never of
+the thread, and must not be used to detect that something arrived.
+
 `send --new` opens the desktop app on the project, prefills the composer, presses
 return, then waits for the thread to register and prints its id. Pass `--no-send` to
 stop before the keystroke and approve the message yourself.
