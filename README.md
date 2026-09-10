@@ -122,7 +122,12 @@ claude-codex-bridge threads --project aurora-nuclei   # newest first
 claude-codex-bridge send --project aurora-nuclei --new --message "..."
 claude-codex-bridge send --thread <uuid> --message "..." --wait
 claude-codex-bridge read --thread <uuid> --last 3
+claude-codex-bridge watch --thread <uuid>             # block until the next turn
 ```
+
+`watch` blocks on filesystem events, not a poll interval, so waiting on Codex costs
+nothing while it thinks and returns the moment it answers. Exit code 3 means the
+timeout was reached. Run it as a background job and let it wake you.
 
 `send --new` opens the desktop app on the project, prefills the composer, presses
 return, then waits for the thread to register and prints its id. Pass `--no-send` to

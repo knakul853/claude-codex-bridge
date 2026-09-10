@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { watch as watchFile } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
@@ -13,7 +14,7 @@ import { NativeCodexReviewClient } from "./codex";
 import { runHook } from "./hook";
 import { nativeProcessRunner } from "./process";
 import { readRepositoryState } from "./repository";
-import { openThreadInDesktop, sendToThread } from "./send";
+import { openThreadInDesktop, sendToThread, watchForReply } from "./send";
 import {
   installBridgeHooks,
   readSettings,
@@ -38,6 +39,8 @@ Codex desktop app (has computer use and your browser sessions):
       [--composer-delay S] [--timeout S] [--poll S]
   send --thread UUID --message TEXT [--wait] queue into an existing thread
   read --thread UUID [--last N]              assistant turns from the thread
+  watch --thread UUID [--timeout S]          block on fs events until the next
+                                             assistant turn; exit 3 on timeout
 
 Codex CLI (headless, no computer use):
   start --owner-thread UUID --prompt-file F  run a Claude worker
@@ -178,6 +181,34 @@ async function main(): Promise<void> {
         2,
       )}\n`,
     );
+    return;
+  }
+  if (command === "watch") {
+    const store = SqliteThreadStore.open();
+    const id = required("--thread");
+    const match = store.threads({ limit: 1_000 }).find((t) => t.id === id);
+    if (!match) throw new CliError(`no codex thread ${id}`, 2);
+    const baseline =
+      option("--since") !== undefined
+        ? Number(option("--since"))
+        : match.rolloutPath
+          ? (await readAssistantMessages(match.rolloutPath)).length
+          : 0;
+    const result = await watchForReply(
+      match,
+      {
+        watch: (path, onChange) => watchFile(path, () => onChange()),
+        read: readAssistantMessages,
+        timer: (ms, fire) => {
+          const handle = setTimeout(fire, ms);
+          return { cancel: () => clearTimeout(handle) };
+        },
+      },
+      Number(option("--timeout") ?? 1800) * 1_000,
+      baseline,
+    );
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    if (result.timedOut) process.exitCode = 3;
     return;
   }
   if (command === "send") {

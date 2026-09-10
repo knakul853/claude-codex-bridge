@@ -1,6 +1,7 @@
 import type { CodexReviewClient } from "./codex";
 import type { ProcessRunner } from "./process";
 import {
+  type AssistantMessage,
   type CodexThread,
   readAssistantMessages,
   resolveProject,
@@ -187,4 +188,67 @@ export async function sendToThread(
     }
   }
   return { threadId: thread.id, label: thread.label, timedOut: true };
+}
+
+export interface WatchDeps {
+  watch: (path: string, onChange: () => void) => { close: () => void };
+  read: (path: string) => Promise<AssistantMessage[]>;
+  timer: (ms: number, fire: () => void) => { cancel: () => void };
+}
+
+export interface WatchResult {
+  threadId: string;
+  reply?: string;
+  total: number;
+  timedOut: boolean;
+}
+
+// Blocks on filesystem events rather than a poll interval, so a caller can wait
+// on a Codex turn the way it would wait on any other process.
+export function watchForReply(
+  thread: CodexThread,
+  deps: WatchDeps,
+  timeoutMs: number,
+  baseline: number,
+): Promise<WatchResult> {
+  return new Promise<WatchResult>((resolve, reject) => {
+    if (!thread.rolloutPath) {
+      resolve({ threadId: thread.id, total: 0, timedOut: true });
+      return;
+    }
+    const path = thread.rolloutPath;
+    let settled = false;
+    const finish = (result: WatchResult) => {
+      if (settled) return;
+      settled = true;
+      watcher.close();
+      timer.cancel();
+      resolve(result);
+    };
+    const check = () => {
+      deps
+        .read(path)
+        .then((messages) => {
+          if (messages.length <= baseline) return;
+          finish({
+            threadId: thread.id,
+            reply: messages[messages.length - 1]?.text,
+            total: messages.length,
+            timedOut: false,
+          });
+        })
+        .catch((error: unknown) => {
+          if (settled) return;
+          settled = true;
+          watcher.close();
+          timer.cancel();
+          reject(error);
+        });
+    };
+    const watcher = deps.watch(path, check);
+    const timer = deps.timer(timeoutMs, () =>
+      finish({ threadId: thread.id, total: baseline, timedOut: true }),
+    );
+    check();
+  });
 }

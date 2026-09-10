@@ -3,13 +3,19 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodexReviewClient, CreatedCodexTask } from "../src/codex";
+import type { WatchDeps } from "../src/send";
 import {
   desktopThreadUrl,
   openThreadInDesktop,
   resolveThread,
   sendToThread,
+  watchForReply,
 } from "../src/send";
-import type { CodexThread, ThreadStore } from "../src/threads";
+import type {
+  AssistantMessage,
+  CodexThread,
+  ThreadStore,
+} from "../src/threads";
 import { readAssistantMessages, resolveProject } from "../src/threads";
 
 function assistantLine(text: string): string {
@@ -300,5 +306,72 @@ describe("auto send", () => {
     );
     expect(process.ran.map((argv) => argv[0])).toEqual(["open"]);
     expect(result.awaitingSend).toBe(true);
+  });
+});
+
+describe("watchForReply", () => {
+  const deps = (
+    reads: AssistantMessage[][],
+  ): WatchDeps & { closed: () => boolean; cancelled: () => boolean } => {
+    let closed = false;
+    let cancelled = false;
+    let call = 0;
+    return {
+      closed: () => closed,
+      cancelled: () => cancelled,
+      watch: (_path, onChange) => {
+        queueMicrotask(() => onChange());
+        return {
+          close: () => {
+            closed = true;
+          },
+        };
+      },
+      read: async () => reads[Math.min(call++, reads.length - 1)] ?? [],
+      timer: () => ({
+        cancel: () => {
+          cancelled = true;
+        },
+      }),
+    };
+  };
+
+  const msg = (text: string): AssistantMessage => ({ text, index: 1 });
+
+  test("resolves with the new turn and tears down the watcher", async () => {
+    const d = deps([[msg("old")], [msg("old"), msg("new")]]);
+    const result = await watchForReply(
+      thread({ rolloutPath: "/tmp/r.jsonl" }),
+      d,
+      1_000,
+      1,
+    );
+    expect(result.reply).toBe("new");
+    expect(result.timedOut).toBe(false);
+    expect(d.closed()).toBe(true);
+    expect(d.cancelled()).toBe(true);
+  });
+
+  test("reports a timeout when the deadline fires first", async () => {
+    const result = await watchForReply(
+      thread({ rolloutPath: "/tmp/r.jsonl" }),
+      {
+        watch: () => ({ close: () => {} }),
+        read: async () => [msg("old")],
+        timer: (_ms, fire) => {
+          queueMicrotask(fire);
+          return { cancel: () => {} };
+        },
+      },
+      1,
+      1,
+    );
+    expect(result.timedOut).toBe(true);
+    expect(result.reply).toBeUndefined();
+  });
+
+  test("times out immediately for a thread with no rollout", async () => {
+    const result = await watchForReply(thread(), deps([[]]), 1_000, 0);
+    expect(result.timedOut).toBe(true);
   });
 });
