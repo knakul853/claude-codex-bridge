@@ -138,6 +138,20 @@ the thread, and must not be used to detect that something arrived.
 return, then waits for the thread to register and prints its id. Pass `--no-send` to
 stop before the keystroke and approve the message yourself.
 
+### Codex sending a message back
+
+Codex has no way to reach a running Claude session: the `claude` CLI exposes no
+send-message command, and `claude --resume --bg` starts a new process rather than
+reaching the live one. So Codex writes to an inbox instead.
+
+```bash
+claude-codex-bridge notify --from codex --message "..."   # Codex runs this
+claude-codex-bridge inbox --watch                          # Claude blocks on this
+```
+
+An append-only file rather than a socket: Codex can write when nothing is
+listening and the message still arrives.
+
 ### What this had to work around
 
 Each of these cost an investigation, so they are encoded in the commands rather than

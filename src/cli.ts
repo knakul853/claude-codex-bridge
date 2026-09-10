@@ -12,9 +12,15 @@ import {
 } from "./claude";
 import { NativeCodexReviewClient } from "./codex";
 import { runHook } from "./hook";
+import { appendInbox, defaultInboxPath, parseInbox } from "./inbox";
 import { nativeProcessRunner } from "./process";
 import { readRepositoryState } from "./repository";
-import { openThreadInDesktop, sendToThread, watchForReply } from "./send";
+import {
+  openThreadInDesktop,
+  sendToThread,
+  watchForAppend,
+  watchForReply,
+} from "./send";
 import {
   installBridgeHooks,
   readSettings,
@@ -41,6 +47,10 @@ Codex desktop app (has computer use and your browser sessions):
       [--composer-delay S] [--timeout S] [--poll S]
   send --thread UUID --message TEXT [--wait] queue into an existing thread
   read --thread UUID [--last N]              assistant turns from the thread
+
+Explicit messages from Codex to Claude:
+  notify --message TEXT [--from NAME]        append to the inbox Claude watches
+  inbox [--watch] [--since N] [--timeout S]  read it, or block for the next one
   watch --thread UUID [--timeout S]          block on fs events until the next
                                              assistant turn; exit 3 on timeout
 
@@ -144,6 +154,40 @@ async function main(): Promise<void> {
         : uninstallBridgeHooks(current);
     await writeSettings(path, updated);
     process.stdout.write(`${JSON.stringify({ ok: true, settings: path })}\n`);
+    return;
+  }
+  if (command === "notify") {
+    const path = option("--inbox") ?? defaultInboxPath();
+    await appendInbox(path, {
+      at: new Date().toISOString(),
+      from: option("--from") ?? "codex",
+      message: option("--message") ?? (await prompt()),
+    });
+    process.stdout.write(`${JSON.stringify({ ok: true, inbox: path })}\n`);
+    return;
+  }
+  if (command === "inbox") {
+    const path = option("--inbox") ?? defaultInboxPath();
+    const fromOffset = Number(option("--since") ?? 0);
+    if (!Bun.argv.includes("--watch")) {
+      const file = Bun.file(path);
+      const text = (await file.exists()) ? await file.text() : "";
+      process.stdout.write(
+        `${JSON.stringify(
+          { messages: parseInbox(text), offset: text.length },
+          null,
+          2,
+        )}\n`,
+      );
+      return;
+    }
+    const result = await watchForAppend(
+      path,
+      fromOffset,
+      Number(option("--timeout") ?? 1800) * 1_000,
+    );
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    if (result.timedOut) process.exitCode = 3;
     return;
   }
   if (command === "projects") {

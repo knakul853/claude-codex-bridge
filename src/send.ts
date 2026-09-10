@@ -1,4 +1,5 @@
 import type { CodexReviewClient } from "./codex";
+import { type InboxMessage, parseInbox } from "./inbox";
 import type { ProcessRunner } from "./process";
 import {
   type CodexThread,
@@ -270,5 +271,58 @@ export function watchForReply(
       finish({ threadId: thread.id, timedOut: true }),
     );
     check();
+  });
+}
+
+export interface AppendResult {
+  messages: InboxMessage[];
+  offset: number;
+  timedOut: boolean;
+}
+
+// Same offset-resume rule as the rollout watcher: a count over a window cannot
+// tell you something arrived.
+export async function watchForAppend(
+  path: string,
+  fromOffset: number,
+  timeoutMs: number,
+): Promise<AppendResult> {
+  const read = async (): Promise<{ text: string; size: number }> => {
+    const file = Bun.file(path);
+    if (!(await file.exists())) return { text: "", size: 0 };
+    const whole = await file.text();
+    return { text: whole.slice(fromOffset), size: whole.length };
+  };
+  const initial = await read();
+  if (initial.text.trim()) {
+    return {
+      messages: parseInbox(initial.text),
+      offset: initial.size,
+      timedOut: false,
+    };
+  }
+  return new Promise<AppendResult>((resolve) => {
+    let settled = false;
+    const finish = (result: AppendResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      clearInterval(ticker);
+      resolve(result);
+    };
+    // The file may not exist yet, so a directory-independent tick is simpler and
+    // cheap: this waits on a human-paced event, not a hot loop.
+    const ticker = setInterval(() => {
+      read()
+        .then(({ text, size }) => {
+          if (!text.trim()) return;
+          finish({ messages: parseInbox(text), offset: size, timedOut: false });
+        })
+        .catch(() => {});
+    }, 1_000);
+    const deadline = setTimeout(
+      () => finish({ messages: [], offset: fromOffset, timedOut: true }),
+      timeoutMs,
+    );
   });
 }
