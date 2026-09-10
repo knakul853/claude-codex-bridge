@@ -3,13 +3,17 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodexReviewClient, CreatedCodexTask } from "../src/codex";
-import type { WatchDeps } from "../src/send";
 import {
+  appProcessName,
+  autoSendScript,
   desktopThreadUrl,
   openThreadInDesktop,
+  openUrlArgv,
   resolveThread,
+  resolveWorkspace,
   sendToThread,
   watchForReply,
+  workspaceWarning,
 } from "../src/send";
 import type {
   AssistantMessage,
@@ -119,11 +123,135 @@ describe("resolveThread", () => {
   test("explains what to do when the project has no persisted thread", () => {
     expect(() =>
       resolveThread(store([]), { project: "aurora-nuclei" }),
-    ).toThrow(/open one in Codex/);
+    ).toThrow(/has no thread yet/);
   });
 
   test("requires a destination", () => {
-    expect(() => resolveThread(store([]), {})).toThrow(/--thread or --project/);
+    expect(() => resolveThread(store([]), {})).toThrow(
+      /--thread, --cwd, or --project/,
+    );
+  });
+
+  test("addresses a directory Codex has no project row for", () => {
+    const thread: CodexThread = {
+      id: "t-unlisted",
+      label: "platform work",
+      cwd: "/repo/unlisted",
+      updatedAtMs: 5,
+      rolloutPath: null,
+    };
+    expect(resolveThread(store([thread]), { cwd: "/repo/unlisted" }).id).toBe(
+      "t-unlisted",
+    );
+  });
+});
+
+describe("autoSendScript", () => {
+  test("derives the System Events process name from the bundle path", () => {
+    expect(appProcessName("/Applications/ChatGPT.app")).toBe("ChatGPT");
+    expect(appProcessName("/Applications/Codex.app")).toBe("Codex");
+  });
+
+  test("refuses to type when something else holds focus", () => {
+    const script = autoSendScript("ChatGPT");
+    // A bare keystroke goes to whatever is frontmost, which is how a stray
+    // return reaches the wrong window.
+    expect(script).toContain("frontmost is true");
+    expect(script).toContain('if frontApp is not "ChatGPT" then error');
+  });
+
+  test("addresses the keystroke to the process, not the screen", () => {
+    expect(autoSendScript("ChatGPT")).toContain(
+      'tell process "ChatGPT" to keystroke return',
+    );
+  });
+
+  test("activates the app before typing into it", () => {
+    expect(autoSendScript("ChatGPT")).toStartWith(
+      'tell application "ChatGPT" to activate',
+    );
+  });
+});
+
+describe("workspaceWarning", () => {
+  test("warns before sending that the workspace will be ignored", () => {
+    // Measured: a registered root was ignored too, so registration is no defence.
+    expect(
+      workspaceWarning({ requestedWorkspace: "/repo/a", registered: true }),
+    ).toMatch(/ignores the requested workspace/);
+    expect(
+      workspaceWarning({
+        requestedWorkspace: "/repo/unlisted",
+        registered: false,
+      }),
+    ).toMatch(/not a project root either/);
+  });
+
+  test("reports where the thread actually landed", () => {
+    expect(
+      workspaceWarning({
+        requestedWorkspace: "/repo/wanted",
+        registered: true,
+        actualCwd: "/repo/elsewhere",
+      }),
+    ).toMatch(/opened \/repo\/elsewhere, not \/repo\/wanted/);
+  });
+
+  test("stays quiet when the thread landed where it was asked to", () => {
+    expect(
+      workspaceWarning({
+        requestedWorkspace: "/repo/wanted",
+        registered: true,
+        actualCwd: "/repo/wanted",
+      }),
+    ).toBeUndefined();
+  });
+});
+
+describe("openUrlArgv", () => {
+  test("names the application so a stale handler cannot intercept the link", () => {
+    expect(openUrlArgv("codex://x", "/Applications/ChatGPT.app")).toEqual([
+      "open",
+      "-a",
+      "/Applications/ChatGPT.app",
+      "codex://x",
+    ]);
+  });
+
+  test("falls back to the default handler when no app is installed", () => {
+    expect(openUrlArgv("codex://x", undefined)).toEqual(["open", "codex://x"]);
+  });
+});
+
+describe("resolveWorkspace", () => {
+  test("uses a directory directly and names the project when one owns it", () => {
+    expect(resolveWorkspace(store([]), { cwd: "/repo/a" })).toEqual({
+      root: "/repo/a",
+      project: "aurora-nuclei",
+      registered: true,
+    });
+  });
+
+  test("marks a directory that belongs to no project as unregistered", () => {
+    expect(resolveWorkspace(store([]), { cwd: "/repo/unlisted" })).toEqual({
+      root: "/repo/unlisted",
+      project: "(no codex project)",
+      registered: false,
+    });
+  });
+
+  test("falls back to a project's first root", () => {
+    expect(resolveWorkspace(store([]), { project: "aurora-nuclei" })).toEqual({
+      root: "/repo/a",
+      project: "aurora-nuclei",
+      registered: true,
+    });
+  });
+
+  test("requires one of the two ways to name a workspace", () => {
+    expect(() => resolveWorkspace(store([]), {})).toThrow(
+      /--cwd or --project is required/,
+    );
   });
 });
 
@@ -209,7 +337,7 @@ describe("openThreadInDesktop", () => {
     expect(runner.opened[0]?.[0]).toBe("open");
     expect(result.requestedWorkspace).toBe("/repo/a");
     expect(result.awaitingSend).toBe(true);
-    const url = new URL(runner.opened[0]?.[1] ?? "");
+    const url = new URL(runner.opened[0]?.at(-1) ?? "");
     expect(url.protocol).toBe("codex:");
     expect(url.searchParams.get("workspace")).toBe("/repo/a");
     expect(url.searchParams.get("prompt")).toBe("run the QA brief");

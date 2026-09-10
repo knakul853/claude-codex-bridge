@@ -4,6 +4,11 @@ import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+// Auto-generated threads store their whole first prompt as the title, which is
+// unbounded and can run to kilobytes. Every consumer prints the label, so it is
+// truncated here rather than at each call site.
+const LABEL_LIMIT = 120;
+
 export interface CodexProject {
   id: string;
   name: string;
@@ -95,7 +100,10 @@ export class SqliteThreadStore implements ThreadStore {
         },
         string[]
       >(`select id,
-                coalesce(nullif(name, ''), nullif(title, ''), nullif(substr(first_user_message, 1, 60), ''), '(untitled)') as label,
+                substr(
+                  replace(replace(coalesce(nullif(name, ''), nullif(title, ''), nullif(first_user_message, ''), '(untitled)'), char(10), ' '), char(13), ' '),
+                  1, ${LABEL_LIMIT}
+                ) as label,
                 coalesce(cwd, '') as cwd,
                 coalesce(updated_at_ms, 0) as updated_at_ms,
                 rollout_path

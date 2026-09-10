@@ -55,11 +55,12 @@ test("starts a native isolated Claude worker and persists routing metadata only"
       changedFiles: [],
     },
     process: runner,
+    home: join(root, "bridge-home"),
     now: () => "2026-09-09T00:00:00.000Z",
   });
 
   expect(manifest.sessionId).toBe(sessionId);
-  const launch = calls[0]?.argv ?? [];
+  const launch = calls.find((call) => call.argv[1] === "--bg")?.argv ?? [];
   expect(launch.slice(0, 4)).toEqual([
     "claude",
     "--bg",
@@ -100,4 +101,55 @@ test("refuses dirty or detached starts before launching Claude", async () => {
       process,
     }),
   ).rejects.toThrow("detached");
+});
+
+test("shares the current tree with --here instead of cutting a worktree", async () => {
+  const root = (await Bun.$`mktemp -d /tmp/bridge-here.XXXXXX`.text()).trim();
+  const commonDir = join(root, ".git");
+  roots.push(root);
+  await mkdir(commonDir);
+  const calls: string[][] = [];
+  const runner: ProcessRunner = {
+    async run(argv) {
+      calls.push(argv);
+      if (argv[1] === "--bg")
+        return { stdout: "backgrounded · 55555555\n", stderr: "", exitCode: 0 };
+      if (argv[1] === "agents")
+        return {
+          stdout: JSON.stringify([
+            {
+              id: "55555555",
+              sessionId: "55555555-5555-4555-8555-555555555555",
+              cwd: root,
+              kind: "background",
+              state: "working",
+            },
+          ]),
+          stderr: "",
+          exitCode: 0,
+        };
+      return { stdout: `${commonDir}\n`, stderr: "", exitCode: 0 };
+    },
+  };
+  await startJob({
+    ownerThreadId: "owner-thread",
+    prompt: "review the uncommitted work",
+    repository: {
+      root,
+      commonDir,
+      branch: "dev",
+      head: "b".repeat(40),
+      // --here is the mode a reviewer needs: the work is not committed yet.
+      clean: false,
+      changedFiles: ["src/a.ts"],
+    },
+    here: true,
+    permissionMode: "acceptEdits",
+    process: runner,
+    home: join(root, "bridge-home"),
+  });
+  const launch = calls.find((argv) => argv[1] === "--bg") ?? [];
+  expect(launch).not.toContain("--worktree");
+  expect(launch).toContain("--permission-mode");
+  expect(launch).toContain("acceptEdits");
 });

@@ -6,6 +6,7 @@ import {
   parseSessionId,
   withHandoverContract,
 } from "./contracts";
+import { linkPeer, listPeers } from "./peers";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
 import { type RepositoryState, readRepositoryState } from "./repository";
 import { redactText, truncateText } from "./safety";
@@ -20,7 +21,13 @@ export interface AgentRecord {
   id?: string;
   sessionId: string;
   cwd: string;
+  /** "background" or "interactive"; absent on older Claude Code builds. */
+  kind?: string;
   state?: string;
+  /** Interactive sessions report status ("idle", "busy") and no state. */
+  status?: string;
+  /** Present only while the OS process is alive, so it also proves liveness. */
+  pid?: number;
   name?: string;
 }
 
@@ -38,11 +45,28 @@ export function parseAgentRecords(stdout: string): AgentRecord[] {
         ...(typeof record.id === "string" ? { id: record.id } : {}),
         sessionId: record.sessionId,
         cwd: record.cwd,
+        ...(typeof record.kind === "string" ? { kind: record.kind } : {}),
         ...(typeof record.state === "string" ? { state: record.state } : {}),
+        ...(typeof record.status === "string" ? { status: record.status } : {}),
+        ...(Number.isInteger(record.pid) ? { pid: record.pid as number } : {}),
         ...(typeof record.name === "string" ? { name: record.name } : {}),
       },
     ];
   });
+}
+
+export function isInteractive(agent: AgentRecord): boolean {
+  return agent.kind === "interactive";
+}
+
+// A record keeps its state after the process exits, so only the pid distinguishes
+// a session still holding memory from a stale entry describing a dead one.
+export function isLive(agent: AgentRecord): boolean {
+  return agent.pid !== undefined;
+}
+
+export function isFinished(agent: AgentRecord): boolean {
+  return ["done", "stopped", "failed"].includes(agent.state ?? "");
 }
 
 function samePath(left: string, right: string): boolean {
@@ -75,26 +99,67 @@ async function requireRepositoryBinding(
   }
 }
 
-export async function startJob(input: {
+export const DEFAULT_LIVE_WORKER_LIMIT = 4;
+
+/**
+ * Bridge-spawned Claude sessions still holding an OS process. Each one costs a
+ * few hundred megabytes plus its own MCP children, so spawning is capped against
+ * this rather than left to grow until the machine notices.
+ */
+export async function liveBridgeWorkers(
+  process: ProcessRunner = nativeProcessRunner,
+  home?: string,
+): Promise<AgentRecord[]> {
+  const sessions = new Set(
+    (await listPeers(home))
+      .map((link) => link.claudeSessionId)
+      .filter((id): id is string => id !== undefined),
+  );
+  return (await inventory(process)).filter(
+    (agent) => sessions.has(agent.sessionId) && isLive(agent),
+  );
+}
+
+export interface StartOptions {
   ownerThreadId: string;
   name?: string;
   prompt: string;
   repository: RepositoryState;
+  /** Run in the repository itself instead of cutting a worktree for the worker. */
+  here?: boolean;
+  permissionMode?: string;
+  liveWorkerLimit?: number;
   process?: ProcessRunner;
+  home?: string;
   now?: () => string;
-}): Promise<BridgeManifest> {
+}
+
+export async function startJob(input: StartOptions): Promise<BridgeManifest> {
   const process = input.process ?? nativeProcessRunner;
-  if (!input.repository.clean)
-    throw new Error("start requires a clean working tree");
+  // A worktree is only safe to cut from a clean tree; --here deliberately shares
+  // the tree the work is already in, which is what a reviewer needs to see.
+  if (!input.here && !input.repository.clean)
+    throw new Error(
+      "start requires a clean working tree, or --here to share the current one",
+    );
   if (!input.repository.branch)
     throw new Error("start refuses a detached repository");
+  const limit = input.liveWorkerLimit ?? DEFAULT_LIVE_WORKER_LIMIT;
+  const live = await liveBridgeWorkers(process, input.home);
+  if (live.length >= limit) {
+    throw new Error(
+      `${live.length} bridge workers are already live (limit ${limit}). Close one with \`claude-codex-bridge close\`, or raise --max-live`,
+    );
+  }
   const worktreeName = `claude-codex-${crypto.randomUUID().slice(0, 8)}`;
   const launch = await process.run(
     [
       "claude",
       "--bg",
-      "--worktree",
-      worktreeName,
+      ...(input.here ? [] : ["--worktree", worktreeName]),
+      ...(input.permissionMode
+        ? ["--permission-mode", input.permissionMode]
+        : []),
       ...(input.name ? ["--name", input.name] : []),
       withHandoverContract(input.prompt),
     ],
@@ -125,6 +190,15 @@ export async function startJob(input: {
     createdAt: (input.now ?? (() => new Date().toISOString()))(),
   });
   await writeManifest(manifest);
+  await linkPeer(
+    {
+      cwd: matches[0].cwd,
+      claudeSessionId: manifest.sessionId,
+      codexThreadId: manifest.ownerThreadId,
+      ...(input.name ? { label: input.name } : {}),
+    },
+    input.home,
+  );
   return manifest;
 }
 
@@ -155,6 +229,13 @@ export async function continueJob(input: {
   if (!manifest)
     throw new Error("bridge manifest was not found for this session");
   const agent = await exactAgent(process, id);
+  // An interactive session cannot be resumed in place: --resume --bg would fork a
+  // second process against the same transcript. Reaching it means the inbox.
+  if (isInteractive(agent)) {
+    throw new Error(
+      `session ${id} is interactive; message it with \`claude-codex-bridge notify --to ${id}\` instead`,
+    );
+  }
   if (!["done", "stopped"].includes(agent.state ?? "")) {
     throw new Error(
       "Claude session is live, blocked, failed, or in an unrecognized state",

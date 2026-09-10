@@ -1,5 +1,6 @@
+import { existsSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import type { CodexReviewClient } from "./codex";
-import { type InboxMessage, parseInbox } from "./inbox";
 import type { ProcessRunner } from "./process";
 import {
   type CodexThread,
@@ -13,8 +14,14 @@ export interface SendTarget {
   thread?: string;
   project?: string;
   root?: string;
+  cwd?: string;
 }
 
+/**
+ * A directory is the exact address: Codex's project table is a UI grouping that
+ * omits some working directories entirely and lets two projects share a root, so
+ * a path resolves a destination that a project name cannot.
+ */
 export function resolveThread(
   store: ThreadStore,
   target: SendTarget,
@@ -26,13 +33,25 @@ export function resolveThread(
     if (!match) throw new Error(`no codex thread ${target.thread}`);
     return match;
   }
-  if (!target.project)
-    throw new Error("pass --thread or --project to choose a destination");
-  const project = resolveProject(store.projects(), target.project);
-  const newest = store.threads({ roots: project.roots, limit: 1 })[0];
+  const scope = target.cwd
+    ? { label: target.cwd, roots: [resolvePath(target.cwd)] }
+    : target.project
+      ? (() => {
+          const project = resolveProject(
+            store.projects(),
+            target.project ?? "",
+          );
+          return { label: `project ${project.name}`, roots: project.roots };
+        })()
+      : undefined;
+  if (!scope)
+    throw new Error(
+      "pass --thread, --cwd, or --project to choose a destination",
+    );
+  const newest = store.threads({ roots: scope.roots, limit: 1 })[0];
   if (!newest)
     throw new Error(
-      `project ${project.name} has no thread yet. open one in Codex, send any message so it is persisted, then retry`,
+      `${scope.label} has no thread yet. open one with --new, or send any message in Codex so it is persisted, then retry`,
     );
   return newest;
 }
@@ -62,15 +81,67 @@ export function desktopThreadUrl(workspace: string, message: string): string {
   return `codex://threads/new?${params.toString()}`;
 }
 
+const DESKTOP_APPS = ["/Applications/ChatGPT.app", "/Applications/Codex.app"];
+
+/**
+ * The bundle that should receive the deep link.
+ *
+ * Deleted copies in the Trash and unmounted installer images stay registered as
+ * codex: handlers in LaunchServices, so a bare `open` can hand the URL to a
+ * bundle that cannot service it and the app never comes forward. Naming the
+ * application removes the ambiguity.
+ */
+export function desktopAppPath(): string | undefined {
+  const override = process.env.CODEX_DESKTOP_APP;
+  if (override) return override;
+  return DESKTOP_APPS.find((candidate) => existsSync(candidate));
+}
+
+export function openUrlArgv(url: string, app: string | undefined): string[] {
+  return app ? ["open", "-a", app, url] : ["open", url];
+}
+
 export interface OpenedThread {
   url: string;
   /** Root asked for. The app picks the real cwd itself; see actualCwd. */
   requestedWorkspace: string;
   project: string;
+  /** Whether Codex has a project whose root is the requested directory. */
+  registered: boolean;
   awaitingSend: boolean;
   threadId?: string;
   /** Where the thread actually landed, once it exists. */
   actualCwd?: string;
+  /** Set when the thread will not, or did not, open where it was asked to. */
+  warning?: string;
+}
+
+/**
+ * The app does not honour the deep link's workspace at all: a new thread opens in
+ * whichever workspace the app currently holds, whether or not the requested
+ * directory is a registered project root. Measured against a registered root that
+ * was still ignored, so `--new` cannot choose a directory and the caller is warned
+ * both before and after. To land in a specific repository, queue into a thread
+ * that is already there with --cwd.
+ */
+export function workspaceWarning(input: {
+  requestedWorkspace: string;
+  registered: boolean;
+  actualCwd?: string;
+}): string | undefined {
+  const advice =
+    "queue into an existing thread with --cwd instead of --new to choose the directory";
+  if (input.actualCwd) {
+    return resolvePath(input.actualCwd) ===
+      resolvePath(input.requestedWorkspace)
+      ? undefined
+      : `codex opened ${input.actualCwd}, not ${input.requestedWorkspace}. ${advice}`;
+  }
+  return `codex ignores the requested workspace and opens whichever it currently holds${
+    input.registered
+      ? ""
+      : `, and ${input.requestedWorkspace} is not a project root either`
+  }. Check actualCwd on the result, or ${advice}`;
 }
 
 export interface AutoSendOptions {
@@ -81,6 +152,31 @@ export interface AutoSendOptions {
   now?: () => number;
 }
 
+/** Process name System Events knows an application bundle by. */
+export function appProcessName(appPath: string): string {
+  return (appPath.split("/").pop() ?? appPath).replace(/\.app$/, "");
+}
+
+/**
+ * Submits the composer by pressing return in the Codex process specifically.
+ *
+ * A bare `keystroke return` goes to whatever happens to be frontmost, so a window
+ * that stole focus in the meantime receives it instead. This activates the app,
+ * refuses to type if something else is still in front, and addresses the
+ * keystroke to the process rather than the screen.
+ */
+export function autoSendScript(appName: string): string {
+  return [
+    `tell application "${appName}" to activate`,
+    "delay 0.4",
+    'tell application "System Events"',
+    "  set frontApp to name of first application process whose frontmost is true",
+    `  if frontApp is not "${appName}" then error "focus moved to " & frontApp & "; nothing was typed"`,
+    `  tell process "${appName}" to keystroke return`,
+    "end tell",
+  ].join("\n");
+}
+
 // No query parameter submits the composer, so return has to be pressed, and the
 // thread does not exist until it is — hence discovering the id by watching.
 export async function autoSendAndResolve(
@@ -88,6 +184,7 @@ export async function autoSendAndResolve(
   process: ProcessRunner,
   before: Set<string>,
   options: AutoSendOptions,
+  appName?: string,
 ): Promise<CodexThread | undefined> {
   const sleep =
     options.sleep ??
@@ -97,7 +194,9 @@ export async function autoSendAndResolve(
   await process.run([
     "osascript",
     "-e",
-    'tell application "System Events" to keystroke return',
+    appName
+      ? autoSendScript(appName)
+      : 'tell application "System Events" to keystroke return',
   ]);
   const deadline = now() + options.timeoutMs;
   while (now() < deadline) {
@@ -110,15 +209,30 @@ export async function autoSendAndResolve(
   return undefined;
 }
 
-export async function openThreadInDesktop(
+/**
+ * The deep link takes a workspace path, so a directory is enough to open a
+ * thread. Resolving by project is kept as a convenience, but a working directory
+ * Codex has no project row for is still addressable.
+ */
+export function resolveWorkspace(
   store: ThreadStore,
-  process: ProcessRunner,
   target: SendTarget,
-  message: string,
-  autoSend?: AutoSendOptions,
-): Promise<OpenedThread> {
+): { root: string; project: string; registered: boolean } {
+  if (target.cwd) {
+    const root = resolvePath(target.cwd);
+    const owning = store
+      .projects()
+      .find((candidate) =>
+        candidate.roots.some((r) => resolvePath(r) === root),
+      );
+    return {
+      root,
+      project: owning?.name ?? "(no codex project)",
+      registered: owning !== undefined,
+    };
+  }
   if (!target.project)
-    throw new Error("--project is required to open a thread");
+    throw new Error("--cwd or --project is required to open a thread");
   const project = resolveProject(store.projects(), target.project);
   const root = target.root ?? project.roots[0];
   if (!root)
@@ -128,26 +242,58 @@ export async function openThreadInDesktop(
       `${target.root} is not a root of ${project.name}. roots: ${project.roots.join(", ")}`,
     );
   }
+  return { root, project: project.name, registered: true };
+}
+
+export async function openThreadInDesktop(
+  store: ThreadStore,
+  process: ProcessRunner,
+  target: SendTarget,
+  message: string,
+  autoSend?: AutoSendOptions,
+): Promise<OpenedThread> {
+  const {
+    root,
+    project: projectName,
+    registered,
+  } = resolveWorkspace(store, target);
   const url = desktopThreadUrl(root, message);
   const before = new Set(
     store.threads({ limit: 400 }).map((thread) => thread.id),
   );
-  await process.run(["open", url]);
+  await process.run(openUrlArgv(url, desktopAppPath()));
   if (!autoSend) {
+    const warning = workspaceWarning({ requestedWorkspace: root, registered });
     return {
       url,
       requestedWorkspace: root,
-      project: project.name,
+      project: projectName,
+      registered,
       awaitingSend: true,
+      ...(warning ? { warning } : {}),
     };
   }
-  const created = await autoSendAndResolve(store, process, before, autoSend);
+  const app = desktopAppPath();
+  const created = await autoSendAndResolve(
+    store,
+    process,
+    before,
+    autoSend,
+    app ? appProcessName(app) : undefined,
+  );
+  const warning = workspaceWarning({
+    requestedWorkspace: root,
+    registered,
+    ...(created ? { actualCwd: created.cwd } : {}),
+  });
   return {
     url,
     requestedWorkspace: root,
-    project: project.name,
+    project: projectName,
+    registered,
     awaitingSend: created === undefined,
     ...(created ? { threadId: created.id, actualCwd: created.cwd } : {}),
+    ...(warning ? { warning } : {}),
   };
 }
 
@@ -271,58 +417,5 @@ export function watchForReply(
       finish({ threadId: thread.id, timedOut: true }),
     );
     check();
-  });
-}
-
-export interface AppendResult {
-  messages: InboxMessage[];
-  offset: number;
-  timedOut: boolean;
-}
-
-// Same offset-resume rule as the rollout watcher: a count over a window cannot
-// tell you something arrived.
-export async function watchForAppend(
-  path: string,
-  fromOffset: number,
-  timeoutMs: number,
-): Promise<AppendResult> {
-  const read = async (): Promise<{ text: string; size: number }> => {
-    const file = Bun.file(path);
-    if (!(await file.exists())) return { text: "", size: 0 };
-    const whole = await file.text();
-    return { text: whole.slice(fromOffset), size: whole.length };
-  };
-  const initial = await read();
-  if (initial.text.trim()) {
-    return {
-      messages: parseInbox(initial.text),
-      offset: initial.size,
-      timedOut: false,
-    };
-  }
-  return new Promise<AppendResult>((resolve) => {
-    let settled = false;
-    const finish = (result: AppendResult) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(deadline);
-      clearInterval(ticker);
-      resolve(result);
-    };
-    // The file may not exist yet, so a directory-independent tick is simpler and
-    // cheap: this waits on a human-paced event, not a hot loop.
-    const ticker = setInterval(() => {
-      read()
-        .then(({ text, size }) => {
-          if (!text.trim()) return;
-          finish({ messages: parseInbox(text), offset: size, timedOut: false });
-        })
-        .catch(() => {});
-    }, 1_000);
-    const deadline = setTimeout(
-      () => finish({ messages: [], offset: fromOffset, timedOut: true }),
-      timeoutMs,
-    );
   });
 }
