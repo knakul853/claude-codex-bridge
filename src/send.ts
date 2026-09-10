@@ -62,9 +62,55 @@ export function desktopThreadUrl(workspace: string, message: string): string {
 
 export interface OpenedThread {
   url: string;
-  workspace: string;
+  /** Root asked for. The app picks the real cwd itself; see actualCwd. */
+  requestedWorkspace: string;
   project: string;
-  awaitingSend: true;
+  awaitingSend: boolean;
+  threadId?: string;
+  /** Where the thread actually landed, once it exists. */
+  actualCwd?: string;
+}
+
+export interface AutoSendOptions {
+  composerMs: number;
+  timeoutMs: number;
+  pollMs: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+// The workspace parameter is advisory: the app opens the thread in whichever
+// workspace it currently has for that project, so the caller is told the cwd the
+// thread actually got rather than the one it asked for.
+// The deep link only prefills the composer; no query parameter submits it
+// (autoSubmit, submit and send were all tried and none persisted a thread).
+// Pressing return in the focused app is what sends it, and the thread does not
+// exist until then, so its id has to be discovered by watching for a new one.
+export async function autoSendAndResolve(
+  store: ThreadStore,
+  process: ProcessRunner,
+  before: Set<string>,
+  options: AutoSendOptions,
+): Promise<CodexThread | undefined> {
+  const sleep =
+    options.sleep ??
+    ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+  const now = options.now ?? (() => Date.now());
+  await sleep(options.composerMs);
+  await process.run([
+    "osascript",
+    "-e",
+    'tell application "System Events" to keystroke return',
+  ]);
+  const deadline = now() + options.timeoutMs;
+  while (now() < deadline) {
+    await sleep(options.pollMs);
+    const fresh = store
+      .threads({ limit: 400 })
+      .find((thread) => !before.has(thread.id));
+    if (fresh) return fresh;
+  }
+  return undefined;
 }
 
 export async function openThreadInDesktop(
@@ -72,6 +118,7 @@ export async function openThreadInDesktop(
   process: ProcessRunner,
   target: SendTarget,
   message: string,
+  autoSend?: AutoSendOptions,
 ): Promise<OpenedThread> {
   if (!target.project)
     throw new Error("--project is required to open a thread");
@@ -85,8 +132,26 @@ export async function openThreadInDesktop(
     );
   }
   const url = desktopThreadUrl(root, message);
+  const before = new Set(
+    store.threads({ limit: 400 }).map((thread) => thread.id),
+  );
   await process.run(["open", url]);
-  return { url, workspace: root, project: project.name, awaitingSend: true };
+  if (!autoSend) {
+    return {
+      url,
+      requestedWorkspace: root,
+      project: project.name,
+      awaitingSend: true,
+    };
+  }
+  const created = await autoSendAndResolve(store, process, before, autoSend);
+  return {
+    url,
+    requestedWorkspace: root,
+    project: project.name,
+    awaitingSend: created === undefined,
+    ...(created ? { threadId: created.id, actualCwd: created.cwd } : {}),
+  };
 }
 
 // The queue call returns as soon as Codex accepts the message, so a reply is

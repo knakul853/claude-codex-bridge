@@ -200,7 +200,7 @@ describe("openThreadInDesktop", () => {
       "run the QA brief",
     );
     expect(runner.opened[0]?.[0]).toBe("open");
-    expect(result.workspace).toBe("/repo/a");
+    expect(result.requestedWorkspace).toBe("/repo/a");
     expect(result.awaitingSend).toBe(true);
     const url = new URL(runner.opened[0]?.[1] ?? "");
     expect(url.protocol).toBe("codex:");
@@ -223,5 +223,82 @@ describe("openThreadInDesktop", () => {
         "brief",
       ),
     ).rejects.toThrow(/not a root of aurora-nuclei/);
+  });
+});
+
+describe("auto send", () => {
+  const runner = () => {
+    const ran: string[][] = [];
+    return {
+      ran,
+      run: async (argv: string[]) => {
+        ran.push(argv);
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    };
+  };
+
+  test("presses return and reports the thread that appeared", async () => {
+    const existing = thread({ id: "old" });
+    let created = false;
+    const dynamicStore: ThreadStore = {
+      projects: () => store([]).projects(),
+      threads: () =>
+        created
+          ? [existing, thread({ id: "brand-new", cwd: "/repo/b" })]
+          : [existing],
+    };
+    const process = runner();
+    const result = await openThreadInDesktop(
+      dynamicStore,
+      process,
+      { project: "aurora-nuclei" },
+      "brief",
+      {
+        composerMs: 1,
+        timeoutMs: 100,
+        pollMs: 1,
+        sleep: async () => {
+          created = true;
+        },
+      },
+    );
+    expect(process.ran[0]?.[0]).toBe("open");
+    expect(process.ran[1]?.[0]).toBe("osascript");
+    expect(process.ran[1]?.[2]).toContain("keystroke return");
+    expect(result.threadId).toBe("brand-new");
+    expect(result.awaitingSend).toBe(false);
+    expect(result.actualCwd).toBe("/repo/b");
+  });
+
+  test("reports awaitingSend when no thread appears", async () => {
+    let clock = 0;
+    const result = await openThreadInDesktop(
+      store([thread({ id: "old" })]),
+      runner(),
+      { project: "aurora-nuclei" },
+      "brief",
+      {
+        composerMs: 1,
+        timeoutMs: 10,
+        pollMs: 1,
+        sleep: async () => {},
+        now: () => (clock += 4),
+      },
+    );
+    expect(result.awaitingSend).toBe(true);
+    expect(result.threadId).toBeUndefined();
+  });
+
+  test("skips the keystroke when auto send is not requested", async () => {
+    const process = runner();
+    const result = await openThreadInDesktop(
+      store([]),
+      process,
+      { project: "aurora-nuclei" },
+      "brief",
+    );
+    expect(process.ran.map((argv) => argv[0])).toEqual(["open"]);
+    expect(result.awaitingSend).toBe(true);
   });
 });

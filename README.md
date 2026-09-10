@@ -109,6 +109,51 @@ claude-codex-bridge uninstall-hooks
 
 See [architecture and safety details](docs/architecture.md).
 
+## Talking to the Codex desktop app
+
+`start` and `review` drive Codex through `codex exec`, which runs in the CLI. A CLI
+thread has neither computer use nor your logged-in browser sessions, so anything that
+has to click through a real UI must run in the desktop app instead. These commands
+target it.
+
+```bash
+claude-codex-bridge projects                          # projects and their root directories
+claude-codex-bridge threads --project aurora-nuclei   # newest first
+claude-codex-bridge send --project aurora-nuclei --new --message "..."
+claude-codex-bridge send --thread <uuid> --message "..." --wait
+claude-codex-bridge read --thread <uuid> --last 3
+```
+
+`send --new` opens the desktop app on the project, prefills the composer, presses
+return, then waits for the thread to register and prints its id. Pass `--no-send` to
+stop before the keystroke and approve the message yourself.
+
+### What this had to work around
+
+Each of these cost an investigation, so they are encoded in the commands rather than
+left for the next agent to rediscover.
+
+- **An empty thread does not exist.** Codex persists a thread on its first message, so
+  a thread you just opened in the app is unaddressable until something is sent in it.
+  That is why `send --new` carries the first message instead of creating an empty thread.
+- **The deep link cannot submit.** `codex://threads/new?workspace=&prompt=` prefills the
+  composer only. `autoSubmit`, `submit` and `send` were all tried as query parameters and
+  none of them submitted. Pressing return in the focused app is the only way, which is
+  what `--no-send` opts out of.
+- **`workspace` is advisory.** The app opens the thread in whichever workspace it already
+  has for that project, so the result reports `actualCwd` alongside the root you asked for.
+- **Threads carry no project id.** A project's threads are the ones whose `cwd` is one of
+  its roots, from `project_roots`.
+- **`codex queue` is fire and forget.** It returns once Codex accepts the message, so a
+  reply is only visible by reading the thread's rollout, which is what `--wait` and `read`
+  do. Rollouts are append-only and reach hundreds of megabytes, so only a bounded tail is
+  ever read.
+- **The running app-server is unreachable.** It is launched as `app-server --listen
+  stdio://` by the Electron app and speaks only to its parent, so `codex app-server proxy`
+  cannot attach. Everything here goes through the CLI and the local store instead.
+- **The state file is versioned.** `state_5.sqlite` becomes `state_6.sqlite` on a schema
+  migration, so the newest one is selected at runtime rather than pinned.
+
 ## Handover contract
 
 The bridge appends this requirement to every worker prompt:

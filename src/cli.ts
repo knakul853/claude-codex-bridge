@@ -26,6 +26,30 @@ import {
   SqliteThreadStore,
 } from "./threads";
 
+const USAGE = `claude-codex-bridge <command>
+
+Codex desktop app (has computer use and your browser sessions):
+  projects                                   list projects and their roots
+  threads [--project N] [--limit N]          threads, newest first
+  send --project N --new --message TEXT      open the app, prefill, press return,
+                                             wait for the thread, print its id
+      [--no-send]                            stop before the keystroke
+      [--root PATH]                          advisory; the app picks the real cwd
+      [--composer-delay S] [--timeout S] [--poll S]
+  send --thread UUID --message TEXT [--wait] queue into an existing thread
+  read --thread UUID [--last N]              assistant turns from the thread
+
+Codex CLI (headless, no computer use):
+  start --owner-thread UUID --prompt-file F  run a Claude worker
+  review --session ID                        send a session to Codex for review
+  continue|status|forget --session ID
+
+Setup:
+  doctor | install-hooks | uninstall-hooks
+
+Notes: a thread does not exist until its first message is sent, so --new carries it.
+The deep link cannot auto-submit, which is why return is pressed for you.`;
+
 class CliError extends Error {
   constructor(
     message: string,
@@ -80,6 +104,15 @@ async function settingsPath(): Promise<string> {
 
 async function main(): Promise<void> {
   const command = Bun.argv[2];
+  if (
+    !command ||
+    command === "help" ||
+    command === "--help" ||
+    command === "-h"
+  ) {
+    process.stdout.write(`${USAGE}\n`);
+    return;
+  }
   if (command === "doctor") {
     process.stdout.write(
       `${JSON.stringify({ ok: true, commands: await doctor() }, null, 2)}\n`,
@@ -162,6 +195,13 @@ async function main(): Promise<void> {
           ...(root ? { root } : {}),
         },
         message,
+        Bun.argv.includes("--no-send")
+          ? undefined
+          : {
+              composerMs: Number(option("--composer-delay") ?? 3) * 1_000,
+              timeoutMs: Number(option("--timeout") ?? 60) * 1_000,
+              pollMs: Number(option("--poll") ?? 3) * 1_000,
+            },
       );
       process.stdout.write(`${JSON.stringify(opened, null, 2)}\n`);
       return;
@@ -226,10 +266,7 @@ async function main(): Promise<void> {
     process.stdout.write(`${JSON.stringify({ ok: true, sessionId })}\n`);
     return;
   }
-  throw new CliError(
-    "usage: claude-codex-bridge <doctor|projects|threads|send|read|install-hooks|uninstall-hooks|start|review|continue|status|forget>",
-    2,
-  );
+  throw new CliError(USAGE, 2);
 }
 
 if (import.meta.main) {
