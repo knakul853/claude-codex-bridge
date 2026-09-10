@@ -18,6 +18,11 @@ the source of truth for code state.
   trusting model prose.
 - Continues the same Claude session after owner feedback.
 - Lets Claude request review in an existing or newly created Codex task.
+- Addresses a Codex thread or a Claude session by working directory, so either
+  side can start a collaboration in a repository it was not launched from.
+- Delivers Codex's replies to a per-session lane, waking a waiting Claude session
+  on a filesystem event rather than a poll.
+- Records each pairing, reports what it still costs in memory, and closes it.
 - Suppresses duplicate notifications and never automatically retries an
   uncertain Codex delivery.
 
@@ -99,6 +104,36 @@ Creating a task waits for its first Codex review and prints that response, so a
 Claude session invoking the command can use the feedback immediately. Reusing
 an existing Codex task queues the request asynchronously.
 
+Every session verb takes `--cwd`, so Codex can run them from its own working
+directory and still act on the right repository. Without it the current directory
+is used, which is how a worker ends up in the wrong repo.
+
+```sh
+claude-codex-bridge start --owner-thread <id> --cwd /path/to/repo --here
+```
+
+`start` cuts a worktree inside the target repo by default and requires a clean
+tree. `--here` runs the worker in the repo itself and allows a dirty one, which is
+what a reviewer needs in order to see uncommitted work.
+
+### Closing things down
+
+Each Claude session holds a few hundred megabytes plus its own MCP children, and a
+worker wedged on a permission prompt holds them indefinitely. Spawning is capped at
+four live bridge workers (`--max-live`), and the rest is explicit:
+
+```sh
+claude-codex-bridge peers                        # pairings, with liveness and MB
+claude-codex-bridge reap                          # report only; changes nothing
+claude-codex-bridge reap --apply [--kill-stuck]   # prune finished, optionally wedged
+claude-codex-bridge close --peer <ref> --force --remove-worktree --archive-thread
+```
+
+`reap` reports unless `--apply` is passed, because stopping a session discards its
+unsaved work. A pid is signalled only after the session registry confirms it still
+belongs to that session, since pids are reused and this one came from a file. Only
+worktrees the bridge cut itself are ever removed.
+
 After the native session and worktree have been handled, remove only the
 bridge's routing state:
 
@@ -118,12 +153,16 @@ target it.
 
 ```bash
 claude-codex-bridge projects                          # projects and their root directories
-claude-codex-bridge threads --project aurora-nuclei   # newest first
-claude-codex-bridge send --project aurora-nuclei --new --message "..."
+claude-codex-bridge threads --cwd /path/to/repo       # newest first
+claude-codex-bridge send --cwd /path/to/repo --new --message "..."
 claude-codex-bridge send --thread <uuid> --message "..." --wait
 claude-codex-bridge read --thread <uuid> --last 3
 claude-codex-bridge watch --thread <uuid>             # block until the next turn
 ```
+
+A destination is a **directory**, with `--project` kept as a convenience. Codex's
+project table is a UI grouping: it omits working directories entirely and lets two
+projects share one root, so a path addresses a thread that a project name cannot.
 
 `watch` blocks on filesystem events, not a poll interval, so waiting on Codex costs
 nothing while it thinks and returns the moment it answers. Exit code 3 means the
@@ -140,17 +179,30 @@ stop before the keystroke and approve the message yourself.
 
 ### Codex sending a message back
 
-Codex has no way to reach a running Claude session: the `claude` CLI exposes no
-send-message command, and `claude --resume --bg` starts a new process rather than
-reaching the live one. So Codex writes to an inbox instead.
+Claude Code publishes a record per live session under `~/.claude/sessions`, so a
+peer can discover sessions and address one without running the `claude` CLI.
 
 ```bash
-claude-codex-bridge notify --from codex --message "..."   # Codex runs this
-claude-codex-bridge inbox --watch                          # Claude blocks on this
+claude-codex-bridge sessions                               # live sessions and ids
+claude-codex-bridge sessions --cwd /path/to/repo           # just that directory
+claude-codex-bridge notify --to <session-id> --message "..."
+claude-codex-bridge notify --cwd /path/to/repo --message "..."   # address by directory
+claude-codex-bridge notify --to <session-id> --push --message "..."
+claude-codex-bridge inbox                                  # read this session's lane
+claude-codex-bridge inbox --watch --since <offset>         # block for the next one
 ```
 
-An append-only file rather than a socket: Codex can write when nothing is
-listening and the message still arrives.
+Each addressee gets its own append-only lane under `~/.claude-codex-bridge/inbox`,
+so two Claude sessions watching at once cannot consume each other's messages. An
+unaddressed message goes to the `broadcast` lane. `inbox` with no `--to` resolves
+the caller's own lane from `CLAUDE_CODE_SESSION_ID`.
+
+**The lane is the delivery; `--push` is only a nudge.** A live session also listens
+on a unix socket, and `--push` writes an authenticated message straight into it,
+which appears in that session immediately. That socket acknowledges nothing, so a
+successful write is never proof the session received it — the lane is therefore
+always written first, and a dropped nudge costs a duplicate rather than the
+message. A stopped or restarting session still finds its lane waiting.
 
 ### What this had to work around
 
@@ -164,8 +216,27 @@ left for the next agent to rediscover.
   composer only. `autoSubmit`, `submit` and `send` were all tried as query parameters and
   none of them submitted. Pressing return in the focused app is the only way, which is
   what `--no-send` opts out of.
-- **`workspace` is advisory.** The app opens the thread in whichever workspace it already
-  has for that project, so the result reports `actualCwd` alongside the root you asked for.
+- **`workspace` is ignored, not advisory.** A new thread opens in whichever workspace the
+  app currently holds. Measured against a registered project root, which was ignored too,
+  so `--new` cannot choose a directory. `send --new` reports `actualCwd` and warns when it
+  differs; to land in a specific repository, queue into a thread already there with `--cwd`.
+- **Two stale bundles can claim `codex:`.** A deleted copy in the Trash and an unmounted
+  installer image stay registered as URL handlers, so a bare `open` hands the link to a
+  bundle that cannot service it and the app never appears. The link is opened with
+  `open -a` against a named application instead.
+- **A bare `keystroke return` goes to whatever is frontmost.** The submit keystroke
+  activates the app, verifies it actually holds focus, and addresses the process by name,
+  rather than typing into whichever window happened to steal focus.
+- **Codex's sandbox does not reach the inbox.** Lanes live under the home directory, outside
+  the workspace Codex may write, so `notify` needs that path allowed. Add it once in
+  `~/.codex/config.toml` for unattended use:
+
+  ```toml
+  [sandbox_workspace_write]
+  writable_roots = ["<your home directory>/.claude-codex-bridge"]
+  ```
+- **The two session sources disagree on `kind`.** `~/.claude/sessions` reports `bg` where
+  `claude agents --json` reports `background`, so only `interactive` is matched on.
 - **Threads carry no project id.** A project's threads are the ones whose `cwd` is one of
   its roots, from `project_roots`.
 - **`codex queue` is fire and forget.** It returns once Codex accepts the message, so a
@@ -177,6 +248,23 @@ left for the next agent to rediscover.
   cannot attach. Everything here goes through the CLI and the local store instead.
 - **The state file is versioned.** `state_5.sqlite` becomes `state_6.sqlite` on a schema
   migration, so the newest one is selected at runtime rather than pinned.
+- **The desktop app and the CLI are different versions.** The app bundles its own
+  `codex` and writes the shared sqlite store; `codex update` moves only the standalone
+  CLI the bridge shells out to. Let the two drift and the CLI reads a store a newer
+  app wrote.
+- **A thread title can be the entire generated prompt.** Auto-generated threads store
+  their whole opening message as the title, unbounded, running to kilobytes. Labels are
+  truncated in the query, because every caller prints them and a Claude caller pays for
+  it in context.
+- **A live session can be reached, but not confirmably.** `~/.claude/sessions/<pid>.json`
+  publishes a socket path, and `<pid>.<hash>.key` publishes the `peerToken` a peer
+  authenticates with; `procStart` in both guards against pid reuse. The protocol is
+  newline-delimited JSON: an `auth` line then a `user` line. A wrong token is rejected,
+  and delivery is deferred while the session is busy — but nothing is ever acknowledged,
+  which is why this is a nudge and not the delivery.
+- **An agent record outlives its process.** `claude agents --json` keeps a session's
+  state after it exits, so only the presence of `pid` distinguishes a session still
+  holding memory from a stale record. Interactive sessions report `status`, not `state`.
 
 ## Handover contract
 
