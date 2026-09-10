@@ -79,13 +79,8 @@ export interface AutoSendOptions {
   now?: () => number;
 }
 
-// The workspace parameter is advisory: the app opens the thread in whichever
-// workspace it currently has for that project, so the caller is told the cwd the
-// thread actually got rather than the one it asked for.
-// The deep link only prefills the composer; no query parameter submits it
-// (autoSubmit, submit and send were all tried and none persisted a thread).
-// Pressing return in the focused app is what sends it, and the thread does not
-// exist until then, so its id has to be discovered by watching for a new one.
+// No query parameter submits the composer, so return has to be pressed, and the
+// thread does not exist until it is — hence discovering the id by watching.
 export async function autoSendAndResolve(
   store: ThreadStore,
   process: ProcessRunner,
