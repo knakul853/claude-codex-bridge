@@ -50,9 +50,11 @@ claude-codex-bridge doctor
 claude-codex-bridge install-hooks
 ```
 
-Hook installation updates the current repository's `.claude/settings.json`
-and preserves unrelated settings and hooks. Commit that settings change if you
-want teammates to use the bridge too.
+Hook installation updates the user's `~/.claude/settings.json` (or
+`$CLAUDE_CONFIG_DIR/settings.json`) and preserves unrelated settings and hooks.
+The hook applies to every repository and safely does nothing for sessions the
+bridge does not own. `start` refuses to launch until both completion hooks are
+installed, so a worker cannot finish without a delivery path.
 
 ## Use
 

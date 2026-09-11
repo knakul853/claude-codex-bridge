@@ -11,6 +11,11 @@ import { nativeProcessRunner, type ProcessRunner } from "./process";
 import { type RepositoryState, readRepositoryState } from "./repository";
 import { redactText, truncateText } from "./safety";
 import {
+  bridgeHooksInstalled,
+  claudeSettingsPath,
+  readSettings,
+} from "./settings";
+import {
   forgetState,
   loadManifest,
   saveManifest,
@@ -132,6 +137,7 @@ export interface StartOptions {
   process?: ProcessRunner;
   home?: string;
   now?: () => string;
+  hooksReady?: () => Promise<boolean>;
 }
 
 export async function startJob(input: StartOptions): Promise<BridgeManifest> {
@@ -144,6 +150,15 @@ export async function startJob(input: StartOptions): Promise<BridgeManifest> {
     );
   if (!input.repository.branch)
     throw new Error("start refuses a detached repository");
+  const hooksReady =
+    input.hooksReady ??
+    (async () =>
+      bridgeHooksInstalled(await readSettings(claudeSettingsPath())));
+  if (!(await hooksReady())) {
+    throw new Error(
+      "Claude completion hooks are not installed; run `claude-codex-bridge install-hooks`",
+    );
+  }
   const limit = input.liveWorkerLimit ?? DEFAULT_LIVE_WORKER_LIMIT;
   const live = await liveBridgeWorkers(process, input.home);
   if (live.length >= limit) {

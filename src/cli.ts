@@ -2,7 +2,7 @@
 
 import { watch as watchFile } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import {
   continueJob,
   forgetJob,
@@ -27,6 +27,7 @@ import { readRepositoryState } from "./repository";
 import { openThreadInDesktop, sendToThread, watchForReply } from "./send";
 import { currentSessionId, listClaudeSessions } from "./sessions";
 import {
+  claudeSettingsPath,
   installBridgeHooks,
   readSettings,
   uninstallBridgeHooks,
@@ -145,15 +146,6 @@ async function doctor(): Promise<Record<string, string>> {
   return checks;
 }
 
-async function settingsPath(): Promise<string> {
-  const root = await nativeProcessRunner.run([
-    "git",
-    "rev-parse",
-    "--show-toplevel",
-  ]);
-  return join(resolve(root.stdout.trim()), ".claude", "settings.json");
-}
-
 // A Claude session invoking the bridge inherits its own id, so reading "my lane"
 // needs no argument.
 function laneFor(explicit?: string): string {
@@ -188,7 +180,7 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "install-hooks" || command === "uninstall-hooks") {
-    const path = await settingsPath();
+    const path = claudeSettingsPath();
     const current = await readSettings(path);
     const updated =
       command === "install-hooks"

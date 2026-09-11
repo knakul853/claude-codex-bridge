@@ -13,6 +13,7 @@ afterEach(async () => {
 async function run(cwd: string, command: string): Promise<number> {
   const child = Bun.spawn([process.execPath, cli, command], {
     cwd,
+    env: { ...process.env, HOME: cwd },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -23,10 +24,9 @@ async function run(cwd: string, command: string): Promise<number> {
   return child.exited;
 }
 
-test("install and uninstall commands preserve unrelated project hooks", async () => {
+test("install and uninstall commands preserve unrelated user hooks", async () => {
   const root = (await Bun.$`mktemp -d /tmp/bridge-cli.XXXXXX`.text()).trim();
   roots.push(root);
-  await Bun.$`git init -q ${root}`;
   await mkdir(join(root, ".claude"));
   await writeFile(
     join(root, ".claude", "settings.json"),

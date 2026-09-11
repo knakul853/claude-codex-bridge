@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import { mkdir, open, readFile, rename } from "node:fs/promises";
-import { dirname } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
 export const HOOK_COMMAND = "claude-codex-bridge hook";
 
@@ -27,6 +28,23 @@ function groupHasBridge(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const hooks = (value as JsonObject).hooks;
   return Array.isArray(hooks) && hooks.some(hasBridgeCommand);
+}
+
+export function claudeSettingsPath(): string {
+  const configured = process.env.CLAUDE_CONFIG_DIR?.trim();
+  return configured
+    ? join(resolve(configured), "settings.json")
+    : join(homedir(), ".claude", "settings.json");
+}
+
+export function bridgeHooksInstalled(value: unknown): boolean {
+  const settings = object(value);
+  if (settings.hooks === undefined) return false;
+  const hooks = object(settings.hooks);
+  return ["Stop", "StopFailure"].every((event) => {
+    const groups = hooks[event];
+    return Array.isArray(groups) && groups.some(groupHasBridge);
+  });
 }
 
 export function installBridgeHooks(value: unknown): JsonObject {

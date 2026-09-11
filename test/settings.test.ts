@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  bridgeHooksInstalled,
   HOOK_COMMAND,
   installBridgeHooks,
   uninstallBridgeHooks,
@@ -16,6 +17,8 @@ test("hook installation is idempotent and preserves unrelated hooks", () => {
   expect(JSON.stringify(once)).toContain(HOOK_COMMAND);
   expect(JSON.stringify(once)).toContain("other-hook");
   expect(once.permissions).toEqual(existing.permissions);
+  expect(bridgeHooksInstalled(once)).toBe(true);
+  expect(bridgeHooksInstalled(existing)).toBe(false);
 });
 
 test("uninstall removes only bridge-owned entries", () => {

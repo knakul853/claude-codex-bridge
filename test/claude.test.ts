@@ -55,6 +55,7 @@ test("starts a native isolated Claude worker and persists routing metadata only"
       changedFiles: [],
     },
     process: runner,
+    hooksReady: async () => true,
     home: join(root, "bridge-home"),
     now: () => "2026-09-09T00:00:00.000Z",
   });
@@ -103,6 +104,30 @@ test("refuses dirty or detached starts before launching Claude", async () => {
   ).rejects.toThrow("detached");
 });
 
+test("refuses to launch when completion hooks are missing", async () => {
+  const process: ProcessRunner = {
+    async run() {
+      throw new Error("must not launch");
+    },
+  };
+  await expect(
+    startJob({
+      ownerThreadId: "owner",
+      prompt: "work",
+      repository: {
+        root: "/repo",
+        commonDir: "/repo/.git",
+        branch: "dev",
+        head: "a".repeat(40),
+        clean: true,
+        changedFiles: [],
+      },
+      process,
+      hooksReady: async () => false,
+    }),
+  ).rejects.toThrow("install-hooks");
+});
+
 test("shares the current tree with --here instead of cutting a worktree", async () => {
   const root = (await Bun.$`mktemp -d /tmp/bridge-here.XXXXXX`.text()).trim();
   const commonDir = join(root, ".git");
@@ -146,6 +171,7 @@ test("shares the current tree with --here instead of cutting a worktree", async 
     here: true,
     permissionMode: "acceptEdits",
     process: runner,
+    hooksReady: async () => true,
     home: join(root, "bridge-home"),
   });
   const launch = calls.find((argv) => argv[1] === "--bg") ?? [];
