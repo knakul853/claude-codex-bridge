@@ -47,15 +47,38 @@ export type HookResult =
   | { kind: "allow"; warning?: string }
   | { kind: "block"; reason: string };
 
-function bounded(value: unknown, name: string, maxBytes: number): string {
+function bounded(
+  value: unknown,
+  name: string,
+  maxBytes: number,
+  allowTextWhitespace = false,
+): string {
   if (typeof value !== "string" || value.length === 0)
     throw new Error(`${name} is required`);
   if (new TextEncoder().encode(value).byteLength > maxBytes)
     throw new Error(`${name} is too large`);
-  if (/\p{Cc}/u.test(value)) {
+  if (hasUnsafeControl(value, allowTextWhitespace)) {
     throw new Error(`${name} contains a terminal control character`);
   }
   return value;
+}
+
+function hasUnsafeControl(
+  value: string,
+  allowTextWhitespace: boolean,
+): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    const control = code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+    if (!control) continue;
+    if (
+      allowTextWhitespace &&
+      (code === 0x09 || code === 0x0a || code === 0x0d)
+    )
+      continue;
+    return true;
+  }
+  return false;
 }
 
 export function parseHookInput(value: unknown): HookInput {
@@ -80,11 +103,12 @@ export function parseHookInput(value: unknown): HookInput {
             record.last_assistant_message,
             "assistant message",
             128 * 1024,
+            true,
           ),
         }
       : {}),
     ...(typeof record.error === "string"
-      ? { error: bounded(record.error, "hook error", 4_000) }
+      ? { error: bounded(record.error, "hook error", 4_000, true) }
       : {}),
   };
 }

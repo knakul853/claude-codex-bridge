@@ -71,7 +71,7 @@ test("delivers one structured handover with independently read Git state", async
     cwd: "/repo/worktree",
     hook_event_name: "Stop",
     last_assistant_message:
-      '<agent_handover>{"disposition":"ready_for_review","summary":"Fixed it; API_KEY=<fake>"}</agent_handover>',
+      'Work completed.\n\n<agent_handover>{"disposition":"ready_for_review","summary":"Fixed it; API_KEY=<fake>"}</agent_handover>\n',
   };
   expect(await handleHook(input, deps)).toEqual({ kind: "allow" });
   expect(await handleHook(input, deps)).toEqual({ kind: "allow" });
