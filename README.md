@@ -135,12 +135,15 @@ claude-codex-bridge close --peer <ref> --force --remove-worktree --archive-threa
 ```
 
 `reap` reports unless `--apply` is passed, because stopping a session discards its
-unsaved work. A pid is signalled only after the session registry confirms it still
-belongs to that session, since pids are reused and this one came from a file. Only
-worktrees the bridge cut itself are ever removed.
+unsaved work; a session whose native state says it ended has none left to lose, so
+only a working or blocked one needs `--force`. A pid is signalled only after the
+session registry confirms it still belongs to that session, since pids are reused
+and this one came from a file. Only worktrees the bridge cut itself are ever
+removed. Both verbs drop the routing state with the pairing, so nothing is left
+behind to clean up by hand.
 
-After the native session and worktree have been handled, remove only the
-bridge's routing state:
+`forget` removes routing state on its own, for a session closed before the bridge
+did that itself:
 
 ```sh
 claude-codex-bridge forget --session <claude-session-uuid>

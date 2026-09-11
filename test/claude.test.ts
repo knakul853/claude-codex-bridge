@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { continueJob, startJob } from "../src/claude";
+import { continueJob, forgetJob, startJob } from "../src/claude";
 import type { ProcessRunner } from "../src/process";
-import { writeManifest } from "../src/state";
+import { loadManifest, writeManifest } from "../src/state";
 
 const roots: string[] = [];
 const sessionId = "44444444-4444-4444-8444-444444444444";
@@ -246,4 +246,36 @@ test("tracks the new session id returned by a background continuation", async ()
       "utf8",
     ),
   ).not.toContain("Fix planner visibility");
+});
+
+test("forgets state for a session Claude no longer lists, but not a live one", async () => {
+  const root = (await Bun.$`mktemp -d /tmp/bridge-forget.XXXXXX`.text()).trim();
+  const commonDir = join(root, ".git");
+  roots.push(root);
+  await mkdir(commonDir);
+  await writeManifest({
+    schemaVersion: 1,
+    sessionId,
+    ownerThreadId: "owner-thread",
+    gitCommonDir: commonDir,
+    createdAt: "2026-09-11T00:00:00.000Z",
+  });
+  let agents: Array<Record<string, unknown>> = [
+    { id: "44444444", sessionId, cwd: root, pid: 404, state: "working" },
+  ];
+  const runner: ProcessRunner = {
+    async run(argv) {
+      if (argv[0] === "claude")
+        return { stdout: JSON.stringify(agents), stderr: "", exitCode: 0 };
+      return { stdout: `${commonDir}\n`, stderr: "", exitCode: 0 };
+    },
+  };
+
+  await expect(
+    forgetJob({ sessionId, gitCommonDir: commonDir, process: runner }),
+  ).rejects.toThrow("forget refuses a live or blocked session");
+  agents = [];
+  await forgetJob({ sessionId, gitCommonDir: commonDir, process: runner });
+
+  expect(await loadManifest(commonDir, sessionId)).toBeUndefined();
 });

@@ -13,6 +13,7 @@ export interface PeerIdentity {
   cwd: string;
   claudeSessionId?: string;
   codexThreadId?: string;
+  gitCommonDir?: string;
   label?: string;
 }
 
@@ -100,6 +101,9 @@ export async function linkPeer(
       : {}),
     ...((identity.codexThreadId ?? existing?.codexThreadId)
       ? { codexThreadId: identity.codexThreadId ?? existing?.codexThreadId }
+      : {}),
+    ...((identity.gitCommonDir ?? existing?.gitCommonDir)
+      ? { gitCommonDir: identity.gitCommonDir ?? existing?.gitCommonDir }
       : {}),
     ...((identity.label ?? existing?.label)
       ? { label: identity.label ?? existing?.label }

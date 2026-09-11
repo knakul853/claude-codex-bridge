@@ -48,6 +48,9 @@ export interface PeerLink {
   cwd: string;
   claudeSessionId?: string;
   codexThreadId?: string;
+  /** Where this session's routing state lives, so cleanup finds it after the
+   * worktree is gone. Absent on links recorded before it was written down. */
+  gitCommonDir?: string;
   label?: string;
   createdAt: string;
   updatedAt: string;
@@ -193,6 +196,7 @@ export function parsePeerLink(value: unknown): PeerLink {
     "codexThreadId",
     "createdAt",
     "cwd",
+    "gitCommonDir",
     "id",
     "label",
     "schemaVersion",
@@ -216,6 +220,13 @@ export function parsePeerLink(value: unknown): PeerLink {
   }
   if (record.codexThreadId !== undefined) {
     link.codexThreadId = parseThreadRef(record.codexThreadId);
+  }
+  if (record.gitCommonDir !== undefined) {
+    link.gitCommonDir = boundedString(
+      record.gitCommonDir,
+      "Git common directory",
+      1_024,
+    );
   }
   if (record.label !== undefined) {
     link.label = boundedString(record.label, "label", 128);

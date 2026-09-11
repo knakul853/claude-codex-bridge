@@ -5,11 +5,13 @@ import { join } from "node:path";
 import { closePeer, reapPeers, surveyPeers } from "../src/lifecycle";
 import { linkPeer, listPeers } from "../src/peers";
 import type { ProcessRunner } from "../src/process";
+import { loadManifest, writeManifest } from "../src/state";
 
 const paths: string[] = [];
 const working = "11111111-1111-4111-8111-111111111111";
 const finished = "22222222-2222-4222-8222-222222222222";
 const stuck = "33333333-3333-4333-8333-333333333333";
+const failed = "44444444-4444-4444-8444-444444444444";
 let previousSessionsDir: string | undefined;
 
 async function temporary(prefix: string): Promise<string> {
@@ -34,7 +36,10 @@ async function sessionRegistry(
   return root;
 }
 
-function runner(agents: Array<Record<string, unknown>>): {
+function runner(
+  agents: Array<Record<string, unknown>>,
+  gitCommonDir = "",
+): {
   process: ProcessRunner;
   calls: string[][];
 } {
@@ -48,7 +53,7 @@ function runner(agents: Array<Record<string, unknown>>): {
           return { stdout: JSON.stringify(agents), stderr: "", exitCode: 0 };
         if (argv[0] === "ps")
           return { stdout: "  101   256000\n", stderr: "", exitCode: 0 };
-        return { stdout: "", stderr: "", exitCode: 0 };
+        return { stdout: gitCommonDir, stderr: "", exitCode: 0 };
       },
     },
   };
@@ -105,6 +110,30 @@ describe("surveyPeers", () => {
     expect(survey[0]?.residentMb).toBe(250);
   });
 
+  // A background session keeps its host process after it ends, so the native
+  // state has to outrank the pid or a dead worker reads as a working one.
+  test("treats a failed session still holding its host process as finished", async () => {
+    const home = await temporary("bridge-life-home-");
+    await sessionRegistry([
+      { pid: 404, sessionId: failed, cwd: "/repo/d", kind: "bg" },
+    ]);
+    await linkPeer({ cwd: "/repo/d", claudeSessionId: failed }, home);
+    const survey = await surveyPeers(
+      runner([
+        {
+          sessionId: failed,
+          cwd: "/repo/d",
+          pid: 404,
+          status: "idle",
+          state: "failed",
+        },
+      ]).process,
+      home,
+    );
+    expect(survey[0]?.disposition).toBe("finished");
+    expect(survey[0]?.pid).toBe(404);
+  });
+
   test("treats a peer with no matching agent record as gone", async () => {
     const home = await temporary("bridge-life-home-");
     await sessionRegistry([]);
@@ -141,6 +170,35 @@ describe("reapPeers", () => {
     });
     expect(result.applied).toBe(true);
     expect(await listPeers(home)).toHaveLength(0);
+  });
+
+  test("prunes a failed session and the routing state it left behind", async () => {
+    const home = await temporary("bridge-life-home-");
+    const commonDir = await temporary("bridge-life-git-");
+    // No registry record: the pid the inventory reports is unverified, so it
+    // must be reported rather than signalled.
+    await sessionRegistry([]);
+    // A link recorded before the repository was, so cleanup has to resolve it.
+    await linkPeer({ cwd: "/repo/d", claudeSessionId: failed }, home);
+    await writeManifest({
+      schemaVersion: 1,
+      sessionId: failed,
+      ownerThreadId: "owner-thread",
+      gitCommonDir: commonDir,
+      createdAt: "2026-09-11T00:00:00.000Z",
+    });
+    const result = await reapPeers({
+      apply: true,
+      process: runner(
+        [{ sessionId: failed, cwd: "/repo/d", pid: 404, state: "failed" }],
+        commonDir,
+      ).process,
+      home,
+    });
+    expect(result.actions.join(" ")).toMatch(/could not stop pid 404/);
+    expect(result.actions.join(" ")).toMatch(/forgot routing state/);
+    expect(await listPeers(home)).toHaveLength(0);
+    expect(await loadManifest(commonDir, failed)).toBeUndefined();
   });
 
   test("leaves a working session alone", async () => {
@@ -210,6 +268,37 @@ describe("closePeer", () => {
     });
     expect(result.actions.join(" ")).toMatch(/forgot peer/);
     expect(await listPeers(home)).toHaveLength(0);
+  });
+
+  test("removes the routing state of an ended session whose worktree is gone", async () => {
+    const home = await temporary("bridge-life-home-");
+    const commonDir = await temporary("bridge-life-git-");
+    await sessionRegistry([]);
+    await linkPeer(
+      { cwd: "/repo/gone", claudeSessionId: failed, gitCommonDir: commonDir },
+      home,
+    );
+    await writeManifest({
+      schemaVersion: 1,
+      sessionId: failed,
+      ownerThreadId: "owner-thread",
+      gitCommonDir: commonDir,
+      createdAt: "2026-09-11T00:00:00.000Z",
+    });
+    const recorder = runner([
+      { sessionId: failed, cwd: "/repo/gone", pid: 404, state: "failed" },
+    ]);
+    const result = await closePeer({
+      reference: failed,
+      process: recorder.process,
+      home,
+    });
+    expect(result.actions.join(" ")).toMatch(/forgot routing state/);
+    expect(await loadManifest(commonDir, failed)).toBeUndefined();
+    expect(await listPeers(home)).toHaveLength(0);
+    expect(recorder.calls.some((argv) => argv.includes("rev-parse"))).toBe(
+      false,
+    );
   });
 
   test("archives the Codex thread only when asked", async () => {

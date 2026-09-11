@@ -31,7 +31,8 @@ export interface AgentRecord {
   state?: string;
   /** Interactive sessions report status ("idle", "busy") and no state. */
   status?: string;
-  /** Present only while the OS process is alive, so it also proves liveness. */
+  /** The host process, which outlives the work: an ended session still reports
+   * one. It proves memory is still held, not that the session is running. */
   pid?: number;
   name?: string;
 }
@@ -64,8 +65,8 @@ export function isInteractive(agent: AgentRecord): boolean {
   return agent.kind === "interactive";
 }
 
-// A record keeps its state after the process exits, so only the pid distinguishes
-// a session still holding memory from a stale entry describing a dead one.
+// Whether the session still costs memory, which is what the spawn cap counts.
+// Whether it is still working is a question for its state, not its pid.
 export function isLive(agent: AgentRecord): boolean {
   return agent.pid !== undefined;
 }
@@ -216,6 +217,7 @@ export async function startJob(input: StartOptions): Promise<BridgeManifest> {
       cwd: agent.cwd,
       claudeSessionId: manifest.sessionId,
       codexThreadId: manifest.ownerThreadId,
+      gitCommonDir: manifest.gitCommonDir,
       ...(input.name ? { label: input.name } : {}),
     },
     input.home,
@@ -285,6 +287,7 @@ export async function continueJob(input: {
       cwd: resumed.cwd,
       claudeSessionId: continuation.sessionId,
       codexThreadId: continuation.ownerThreadId,
+      gitCommonDir: continuation.gitCommonDir,
       ...(continuation.name ? { label: continuation.name } : {}),
     },
     input.home,
@@ -388,6 +391,11 @@ export async function jobStatus(input: {
   return { manifest, agents };
 }
 
+/**
+ * Deletes the bridge's own routing state. A session Claude no longer lists cannot
+ * be live, so the manifest recorded under this repository is what proves the
+ * state is ours to delete; a session still in the inventory must also have ended.
+ */
 export async function forgetJob(input: {
   sessionId: string;
   gitCommonDir: string;
@@ -395,11 +403,22 @@ export async function forgetJob(input: {
 }): Promise<void> {
   const process = input.process ?? nativeProcessRunner;
   const id = parseSessionId(input.sessionId);
-  const agent = await exactAgent(process, id);
-  if (!["done", "stopped", "failed"].includes(agent.state ?? "")) {
-    throw new Error("forget refuses a live, blocked, or unrecognized session");
+  if (!(await loadManifest(input.gitCommonDir, id))) {
+    throw new Error("bridge manifest was not found for this session");
   }
-  await requireRepositoryBinding(process, agent.cwd, input.gitCommonDir);
+  const matches = (await inventory(process)).filter(
+    (agent) => agent.sessionId === id,
+  );
+  if (matches.length > 1) {
+    throw new Error("Claude session matches more than one inventory record");
+  }
+  const agent = matches[0];
+  if (agent) {
+    if (!isFinished(agent)) {
+      throw new Error("forget refuses a live or blocked session");
+    }
+    await requireRepositoryBinding(process, agent.cwd, input.gitCommonDir);
+  }
   await forgetState(input.gitCommonDir, id);
 }
 

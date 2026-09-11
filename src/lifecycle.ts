@@ -1,15 +1,11 @@
 import { rm } from "node:fs/promises";
-import { basename, resolve } from "node:path";
-import {
-  type AgentRecord,
-  isFinished,
-  isLive,
-  parseAgentRecords,
-} from "./claude";
+import { basename, isAbsolute, resolve } from "node:path";
+import { type AgentRecord, isFinished, parseAgentRecords } from "./claude";
 import type { PeerLink } from "./contracts";
 import { findPeer, listPeers, unlinkPeer } from "./peers";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
 import { listClaudeSessions } from "./sessions";
+import { forgetState } from "./state";
 
 /** Worktrees the bridge cut itself, which are the only ones it may remove. */
 const BRIDGE_WORKTREE = /^claude-codex-[0-9a-f]{8}$/;
@@ -51,9 +47,10 @@ async function residentMb(
 }
 
 /**
- * Classifies every recorded collaboration by whether its Claude session is still
- * consuming memory. A record keeps its state after the process exits, so a
- * missing pid is what distinguishes a dead session from a live one.
+ * Classifies every recorded collaboration by what its Claude session is doing and
+ * whether it still costs memory. A finished session keeps its host process alive
+ * and reports a pid, so the native state decides whether it ended and the pid
+ * only says there is still something to reclaim.
  */
 export async function surveyPeers(
   process: ProcessRunner = nativeProcessRunner,
@@ -75,13 +72,13 @@ export async function surveyPeers(
       agent?.pid ?? live.find((s) => s.sessionId === peer.claudeSessionId)?.pid;
     const disposition: PeerDisposition = !agent
       ? "gone"
-      : pid === undefined && !isLive(agent)
-        ? isFinished(agent)
-          ? "finished"
-          : "gone"
-        : agent.state === "blocked"
-          ? "stuck"
-          : "working";
+      : isFinished(agent)
+        ? "finished"
+        : pid === undefined
+          ? "gone"
+          : agent.state === "blocked"
+            ? "stuck"
+            : "working";
     health.push({
       peer,
       disposition,
@@ -143,6 +140,49 @@ async function removeWorktree(
   }
 }
 
+async function repositoryOf(
+  peer: PeerLink,
+  process: ProcessRunner,
+): Promise<string | undefined> {
+  if (peer.gitCommonDir) return peer.gitCommonDir;
+  const common = (
+    await process.run([
+      "git",
+      "-C",
+      peer.cwd,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ])
+  ).stdout.trim();
+  return isAbsolute(common) ? common : undefined;
+}
+
+/**
+ * Drops the manifest and delivery records the bridge kept for the session, so a
+ * closed collaboration leaves nothing for `forget` to chase. Links recorded
+ * before the repository was written down are resolved through the worktree, which
+ * is why this runs before the worktree is removed.
+ */
+async function forgetRouting(
+  peer: PeerLink,
+  process: ProcessRunner,
+): Promise<string | undefined> {
+  if (!peer.claudeSessionId) return;
+  try {
+    const gitCommonDir = await repositoryOf(peer, process);
+    if (!gitCommonDir) {
+      return `kept routing state for ${peer.claudeSessionId}: ${peer.cwd} names no repository`;
+    }
+    await forgetState(gitCommonDir, peer.claudeSessionId);
+    return `forgot routing state for ${peer.claudeSessionId}`;
+  } catch (error) {
+    return `could not forget routing state for ${peer.claudeSessionId}: ${
+      error instanceof Error ? error.message : "unknown"
+    }`;
+  }
+}
+
 export interface CloseOptions {
   reference: string;
   /** Signal a live session instead of refusing to close it. */
@@ -167,7 +207,12 @@ export async function closePeer(input: CloseOptions): Promise<CloseResult> {
     (entry) => entry.peer.id === peer.id,
   );
   if (survey?.pid !== undefined && peer.claudeSessionId) {
-    if (!input.force) {
+    // Only a session that has not ended can lose unsaved work to a signal; a
+    // finished one is a host process still holding memory.
+    if (
+      !input.force &&
+      (survey.disposition === "working" || survey.disposition === "stuck")
+    ) {
       throw new Error(
         `session ${peer.claudeSessionId} is still ${survey.disposition} (pid ${survey.pid}, ${survey.residentMb ?? "?"} MB). Pass --force to stop it`,
       );
@@ -183,6 +228,8 @@ export async function closePeer(input: CloseOptions): Promise<CloseResult> {
         : `could not stop pid ${survey.pid}; it no longer matches the session`,
     );
   }
+  const forgotten = await forgetRouting(peer, runner);
+  if (forgotten) actions.push(forgotten);
   if (input.removeWorktree) {
     const removed = await removeWorktree(resolve(peer.cwd), runner);
     if (removed) actions.push(removed);
