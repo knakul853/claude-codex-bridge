@@ -30,6 +30,16 @@ async function registry(
   return root;
 }
 
+// The push resolves when the socket closes, which can precede the server's data
+// event, so the bytes are waited for rather than assumed to have landed.
+async function waitForBytes(chunks: string[]): Promise<string> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (chunks.length > 0) return chunks.join("");
+    await new Promise((done) => setTimeout(done, 10));
+  }
+  return chunks.join("");
+}
+
 async function laneMessages(path: string) {
   return parseInbox(await readFile(path, "utf8"));
 }
@@ -221,13 +231,81 @@ describe("notifyClaude", () => {
       expect((await laneMessages(result.lane)).map((m) => m.message)).toEqual([
         "both paths",
       ]);
-      const wire = received.join("");
+      const wire = await waitForBytes(received);
       expect(wire).toContain('"type":"auth"');
       expect(wire).toContain("token-101");
       expect(wire).toContain("both paths");
     } finally {
       server.close();
     }
+  });
+
+  test("still reaches a live session when the lane cannot be written", async () => {
+    const sessionsRoot = await temporary("bridge-notify-sessions-");
+    const socketPath = join(sessionsRoot, "live.sock");
+    const received: string[] = [];
+    const server = createServer((socket) => {
+      socket.on("data", (chunk) => received.push(chunk.toString()));
+    });
+    await new Promise<void>((ready) => server.listen(socketPath, ready));
+    await writeFile(
+      join(sessionsRoot, "101.json"),
+      JSON.stringify({
+        pid: 101,
+        sessionId: sessionA,
+        cwd: "/repo/aurora",
+        kind: "interactive",
+        messagingSocketPath: socketPath,
+      }),
+      "utf8",
+    );
+    await writeFile(
+      join(sessionsRoot, "101.abc.key"),
+      JSON.stringify({ peerToken: "token-101" }),
+      "utf8",
+    );
+    try {
+      // A sandboxed sender is denied the lane but can still reach the socket,
+      // so the message must not be discarded with it.
+      const result = await notifyClaude({
+        to: sessionA,
+        from: "codex",
+        message: "lane denied, socket open",
+        home: "/proc/nonexistent-home",
+        sessionsRoot,
+      });
+      expect(result.queued).toBe(false);
+      expect(result.pushed).toBe(true);
+      expect(result.detail).toMatch(/lane unavailable/);
+      expect(await waitForBytes(received)).toContain(
+        "lane denied, socket open",
+      );
+    } finally {
+      server.close();
+    }
+  });
+
+  test("fails loudly when neither channel can take the message", async () => {
+    await expect(
+      notifyClaude({
+        to: sessionA,
+        from: "codex",
+        message: "nowhere to go",
+        home: "/proc/nonexistent-home",
+        sessionsRoot: await temporary("bridge-notify-sessions-"),
+      }),
+    ).rejects.toThrow(/not delivered/);
+  });
+
+  test("reports the lane as queued on the ordinary path", async () => {
+    const result = await notifyClaude({
+      to: sessionA,
+      from: "codex",
+      message: "ordinary",
+      home: await temporary("bridge-notify-home-"),
+      sessionsRoot: await temporary("bridge-notify-sessions-"),
+    });
+    expect(result.queued).toBe(true);
   });
 
   test("refuses an empty notification", async () => {

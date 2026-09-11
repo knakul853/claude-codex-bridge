@@ -24,13 +24,23 @@ export function absent(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
+// Tightened only when it is actually loose. mkdir already applies the mode on
+// creation, so an unconditional chmod is a no-op that still needs permission to
+// change metadata — which a sandboxed caller may be allowed to write but not
+// chmod, failing on a directory that was already correct.
+async function tighten(path: string, mode: number): Promise<void> {
+  const info = await lstat(path);
+  if ((info.mode & 0o777) === mode) return;
+  await chmod(path, mode);
+}
+
 export async function ensurePrivateDirectory(path: string): Promise<void> {
   await mkdir(path, { recursive: true, mode: 0o700 });
   const info = await lstat(path);
   if (!info.isDirectory() || info.isSymbolicLink()) {
     throw new Error("bridge state path must be a real directory");
   }
-  await chmod(path, 0o700);
+  await tighten(path, 0o700);
 }
 
 async function writeTemporary(path: string, value: unknown): Promise<string> {
@@ -56,7 +66,7 @@ async function writeTemporary(path: string, value: unknown): Promise<string> {
 export async function atomicWrite(path: string, value: unknown): Promise<void> {
   const temporary = await writeTemporary(path, value);
   await rename(temporary, path);
-  await chmod(path, 0o600);
+  await tighten(path, 0o600);
 }
 
 export async function atomicCreate(
@@ -66,7 +76,7 @@ export async function atomicCreate(
   const temporary = await writeTemporary(path, value);
   try {
     await link(temporary, path);
-    await chmod(path, 0o600);
+    await tighten(path, 0o600);
   } finally {
     await unlink(temporary).catch((error: unknown) => {
       if (!absent(error)) throw error;

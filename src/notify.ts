@@ -24,6 +24,8 @@ export interface NotifyInput {
 
 export interface NotifyResult {
   lane: string;
+  /** Whether the message was recorded on the lane. */
+  queued: boolean;
   sessionId?: string;
   /** Whether the socket nudge was attempted, and what came of it. */
   pushed?: boolean;
@@ -66,20 +68,37 @@ export async function notifyClaude(input: NotifyInput): Promise<NotifyResult> {
   const addressee = target?.sessionId ?? input.to;
   const lane = inboxLanePath(addressee, input.home);
 
-  await appendInbox(lane, {
-    at: (input.at ?? (() => new Date().toISOString()))(),
-    from: input.from,
-    message,
-    ...(addressee ? { to: addressee } : {}),
-  } satisfies InboxMessage);
+  let queued = true;
+  let laneDetail: string | undefined;
+  try {
+    await appendInbox(lane, {
+      at: (input.at ?? (() => new Date().toISOString()))(),
+      from: input.from,
+      message,
+      ...(addressee ? { to: addressee } : {}),
+    } satisfies InboxMessage);
+  } catch (error) {
+    // A sandboxed sender may be denied the lane while still reaching the
+    // socket. Losing the lane costs durability, so it is reported, but it must
+    // not discard a message the other channel could still deliver.
+    queued = false;
+    laneDetail = `lane unavailable: ${error instanceof Error ? error.message : "write failed"}`;
+  }
 
   const result: NotifyResult = {
     lane,
+    queued,
     ...(addressee ? { sessionId: addressee } : {}),
   };
-  if (!input.push) return result;
+  // Push on request, and also whenever the lane failed: it is then the only
+  // channel left rather than a nudge.
+  if (!input.push && queued) return result;
   if (!target) {
-    return { ...result, pushed: false, detail: "no live session to interrupt" };
+    const detail = [laneDetail, "no live session to interrupt"]
+      .filter(Boolean)
+      .join("; ");
+    if (!queued) throw new Error(`${detail}. The message was not delivered`);
+    return { ...result, pushed: false, detail };
   }
   const pushed = await pushToSession(
     target,
@@ -87,9 +106,13 @@ export async function notifyClaude(input: NotifyInput): Promise<NotifyResult> {
     5_000,
     input.sessionsRoot,
   );
+  const detail = [laneDetail, pushed.detail].filter(Boolean).join("; ");
+  if (!queued && !pushed.delivered) {
+    throw new Error(`${detail}. The message was not delivered`);
+  }
   return {
     ...result,
     pushed: pushed.delivered,
-    ...(pushed.detail ? { detail: pushed.detail } : {}),
+    ...(detail ? { detail } : {}),
   };
 }
