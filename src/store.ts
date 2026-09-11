@@ -24,10 +24,8 @@ export function absent(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
-// Tightened only when it is actually loose. mkdir already applies the mode on
-// creation, so an unconditional chmod is a no-op that still needs permission to
-// change metadata — which a sandboxed caller may be allowed to write but not
-// chmod, failing on a directory that was already correct.
+// Only when actually loose: a sandboxed caller may be permitted to write here
+// yet denied metadata changes, so a no-op chmod fails on a correct directory.
 async function tighten(path: string, mode: number): Promise<void> {
   const info = await lstat(path);
   if ((info.mode & 0o777) === mode) return;
