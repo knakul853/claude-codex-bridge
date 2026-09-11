@@ -1,14 +1,24 @@
-import { afterEach, expect, test } from "bun:test";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { continueJob, forgetJob, startJob } from "../src/claude";
-import type { ProcessRunner } from "../src/process";
+import { BridgeError } from "../src/errors";
+import { linkPeer } from "../src/peers";
+import { NativeCommandError, type ProcessRunner } from "../src/process";
 import { loadManifest, writeManifest } from "../src/state";
 
 const roots: string[] = [];
 const sessionId = "44444444-4444-4444-8444-444444444444";
+const owner = "55555555-5555-4555-8555-555555555555";
+let previousSessionsDir: string | undefined;
+
+beforeEach(() => {
+  previousSessionsDir = process.env.CLAUDE_SESSIONS_DIR;
+});
 
 afterEach(async () => {
+  if (previousSessionsDir === undefined) delete process.env.CLAUDE_SESSIONS_DIR;
+  else process.env.CLAUDE_SESSIONS_DIR = previousSessionsDir;
   for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true });
 });
@@ -278,4 +288,241 @@ test("forgets state for a session Claude no longer lists, but not a live one", a
   await forgetJob({ sessionId, gitCommonDir: commonDir, process: runner });
 
   expect(await loadManifest(commonDir, sessionId)).toBeUndefined();
+});
+
+async function repository(prefix: string): Promise<{
+  root: string;
+  commonDir: string;
+  sessions: string;
+  home: string;
+}> {
+  const root = (await Bun.$`mktemp -d /tmp/${prefix}.XXXXXX`.text()).trim();
+  roots.push(root);
+  const commonDir = join(root, ".git");
+  const sessions = join(root, "sessions");
+  await mkdir(commonDir);
+  await mkdir(sessions);
+  process.env.CLAUDE_SESSIONS_DIR = sessions;
+  return { root, commonDir, sessions, home: join(root, "bridge-home") };
+}
+
+function ownerRunner(
+  agents: Array<Record<string, unknown>>,
+  commonDir: string,
+  live: Array<{ pid: number; command: string }> = [],
+): ProcessRunner {
+  return {
+    async run(argv) {
+      if (argv[1] === "--bg" || argv[1] === "--resume")
+        throw new Error("must not launch a second worker");
+      if (argv[1] === "agents")
+        return { stdout: JSON.stringify(agents), stderr: "", exitCode: 0 };
+      if (argv[0] === "ps") {
+        const wanted = new Set((argv.at(-1) ?? "").split(",").map(Number));
+        const lines = live
+          .filter((entry) => wanted.has(entry.pid))
+          .map((entry) => `${entry.pid} 1 256000 ${entry.command}`);
+        if (lines.length === 0) throw new NativeCommandError("ps", 1, "");
+        return { stdout: `${lines.join("\n")}\n`, stderr: "", exitCode: 0 };
+      }
+      return { stdout: `${commonDir}\n`, stderr: "", exitCode: 0 };
+    },
+  };
+}
+
+test("refuses to share a worktree an active worker already owns", async () => {
+  const repo = await repository("bridge-owner");
+  await linkPeer({ cwd: repo.root, claudeSessionId: owner }, repo.home);
+  const error = await startJob({
+    ownerThreadId: "owner-thread",
+    prompt: "do the same work again",
+    repository: {
+      root: repo.root,
+      commonDir: repo.commonDir,
+      branch: "main",
+      head: "c".repeat(40),
+      clean: false,
+      changedFiles: ["src/a.ts"],
+    },
+    here: true,
+    process: ownerRunner(
+      [
+        {
+          id: "55555555",
+          sessionId: owner,
+          cwd: repo.root,
+          kind: "background",
+          state: "working",
+        },
+      ],
+      repo.commonDir,
+    ),
+    hooksReady: async () => true,
+    home: repo.home,
+  }).catch((reason: unknown) => reason);
+
+  expect(error).toBeInstanceOf(BridgeError);
+  expect((error as BridgeError).code).toBe("worktree_owner_active");
+  expect((error as BridgeError).message).toContain(owner);
+});
+
+// A worker that ended is a host process holding memory, not a second writer.
+test("shares a worktree whose previous worker has settled", async () => {
+  const repo = await repository("bridge-owner-settled");
+  await linkPeer({ cwd: repo.root, claudeSessionId: owner }, repo.home);
+  let launched = false;
+  const runner: ProcessRunner = {
+    async run(argv) {
+      if (argv[1] === "--bg") {
+        launched = true;
+        return { stdout: "backgrounded · 44444444\n", stderr: "", exitCode: 0 };
+      }
+      if (argv[1] === "agents")
+        return {
+          stdout: JSON.stringify([
+            {
+              id: "55555555",
+              sessionId: owner,
+              cwd: repo.root,
+              kind: "background",
+              state: "done",
+            },
+            {
+              id: "44444444",
+              sessionId,
+              cwd: repo.root,
+              kind: "background",
+              state: "working",
+            },
+          ]),
+          stderr: "",
+          exitCode: 0,
+        };
+      return { stdout: `${repo.commonDir}\n`, stderr: "", exitCode: 0 };
+    },
+  };
+
+  await startJob({
+    ownerThreadId: "owner-thread",
+    prompt: "review the uncommitted work",
+    repository: {
+      root: repo.root,
+      commonDir: repo.commonDir,
+      branch: "main",
+      head: "c".repeat(40),
+      clean: false,
+      changedFiles: ["src/a.ts"],
+    },
+    here: true,
+    process: runner,
+    hooksReady: async () => true,
+    home: repo.home,
+  });
+  expect(launched).toBe(true);
+});
+
+test("refuses to continue into a worktree another worker is still writing", async () => {
+  const repo = await repository("bridge-continue-owner");
+  await writeManifest({
+    schemaVersion: 1,
+    sessionId,
+    ownerThreadId: "owner-thread",
+    gitCommonDir: repo.commonDir,
+    createdAt: "2026-09-11T00:00:00.000Z",
+  });
+  await linkPeer({ cwd: repo.root, claudeSessionId: owner }, repo.home);
+  await writeFile(
+    join(repo.sessions, "4242.json"),
+    JSON.stringify({
+      pid: 4242,
+      sessionId: owner,
+      cwd: repo.root,
+      kind: "bg",
+      status: "busy",
+    }),
+    "utf8",
+  );
+  const error = await continueJob({
+    sessionId,
+    prompt: "keep going",
+    gitCommonDir: repo.commonDir,
+    process: ownerRunner(
+      [
+        {
+          id: "44444444",
+          sessionId,
+          cwd: repo.root,
+          kind: "background",
+          state: "done",
+        },
+        {
+          id: "55555555",
+          sessionId: owner,
+          cwd: repo.root,
+          kind: "background",
+          // The label says it ended; the registry says it is busy.
+          state: "failed",
+        },
+      ],
+      repo.commonDir,
+      [
+        {
+          pid: 4242,
+          command: "/opt/claude/versions/2.1.0 --resume /p/o.jsonl",
+        },
+      ],
+    ),
+    home: repo.home,
+  }).catch((reason: unknown) => reason);
+
+  expect(error).toBeInstanceOf(BridgeError);
+  expect((error as BridgeError).code).toBe("worktree_owner_active");
+});
+
+// A launch the bridge cannot parse still started a worker, and that worker owns
+// a worktree nothing is tracking. Colour is on whenever FORCE_COLOR is set.
+test("records a worker whose launch line arrived with colour codes", async () => {
+  const repo = await repository("bridge-ansi");
+  const runner: ProcessRunner = {
+    async run(argv) {
+      if (argv[1] === "--bg")
+        return {
+          stdout: "backgrounded · \u001b[36m44444444\u001b[39m · worker\n",
+          stderr: "",
+          exitCode: 0,
+        };
+      if (argv[1] === "agents")
+        return {
+          stdout: JSON.stringify([
+            {
+              id: "44444444",
+              sessionId,
+              cwd: repo.root,
+              kind: "background",
+              state: "working",
+            },
+          ]),
+          stderr: "",
+          exitCode: 0,
+        };
+      return { stdout: `${repo.commonDir}\n`, stderr: "", exitCode: 0 };
+    },
+  };
+
+  const manifest = await startJob({
+    ownerThreadId: "owner-thread",
+    prompt: "work",
+    repository: {
+      root: repo.root,
+      commonDir: repo.commonDir,
+      branch: "main",
+      head: "c".repeat(40),
+      clean: true,
+      changedFiles: [],
+    },
+    process: runner,
+    hooksReady: async () => true,
+    home: repo.home,
+  });
+  expect(manifest.sessionId).toBe(sessionId);
 });

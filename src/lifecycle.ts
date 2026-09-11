@@ -1,120 +1,77 @@
 import { rm } from "node:fs/promises";
 import { basename, isAbsolute, resolve } from "node:path";
-import { type AgentRecord, isFinished, parseAgentRecords } from "./claude";
+import { type AgentRecord, parseAgentRecords } from "./claude";
 import type { PeerLink } from "./contracts";
+import { BridgeError, errorMessage } from "./errors";
 import { findPeer, listPeers, unlinkPeer } from "./peers";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
-import { listClaudeSessions } from "./sessions";
 import { forgetState } from "./state";
+import {
+  isActive,
+  reconcileSessions,
+  type SessionDisposition,
+  type SessionFacts,
+  type Signaller,
+  stopSession,
+} from "./supervision";
 
 /** Worktrees the bridge cut itself, which are the only ones it may remove. */
 const BRIDGE_WORKTREE = /^claude-codex-[0-9a-f]{8}$/;
 
-export type PeerDisposition = "gone" | "finished" | "stuck" | "working";
+export type PeerDisposition = SessionDisposition;
 
 export interface PeerHealth {
   peer: PeerLink;
   disposition: PeerDisposition;
   agent?: AgentRecord;
+  facts?: SessionFacts;
   pid?: number;
   residentMb?: number;
 }
 
-async function residentMb(
-  pids: number[],
-  process: ProcessRunner,
-): Promise<Map<number, number>> {
-  const sizes = new Map<number, number>();
-  if (pids.length === 0) return sizes;
-  try {
-    const result = await process.run([
-      "ps",
-      "-o",
-      "pid=,rss=",
-      "-p",
-      pids.join(","),
-    ]);
-    for (const line of result.stdout.trim().split("\n")) {
-      const [pid, rss] = line.trim().split(/\s+/).map(Number);
-      if (Number.isInteger(pid) && Number.isInteger(rss)) {
-        sizes.set(pid as number, Math.round((rss as number) / 1024));
-      }
-    }
-  } catch {
-    // Memory figures are advisory; their absence must not block a sweep.
-  }
-  return sizes;
+async function inventory(process: ProcessRunner): Promise<AgentRecord[]> {
+  return parseAgentRecords(
+    (await process.run(["claude", "agents", "--json", "--all"])).stdout,
+  );
 }
 
 /**
- * Classifies every recorded collaboration by what its Claude session is doing and
- * whether it still costs memory. A finished session keeps its host process alive
- * and reports a pid, so the native state decides whether it ended and the pid
- * only says there is still something to reclaim.
+ * Classifies every recorded collaboration by what its Claude session is really
+ * doing. The native state, the session registry and the operating system all
+ * answer that question differently, so each one is reconciled against the
+ * others rather than any single label being believed.
  */
 export async function surveyPeers(
   process: ProcessRunner = nativeProcessRunner,
   home?: string,
 ): Promise<PeerHealth[]> {
   const peers = await listPeers(home);
-  const agents = parseAgentRecords(
-    (await process.run(["claude", "agents", "--json", "--all"])).stdout,
-  );
-  const live = await listClaudeSessions();
-  const health: PeerHealth[] = [];
-  for (const peer of peers) {
-    if (!peer.claudeSessionId) {
-      health.push({ peer, disposition: "gone" });
-      continue;
-    }
-    const agent = agents.find((a) => a.sessionId === peer.claudeSessionId);
-    const pid =
-      agent?.pid ?? live.find((s) => s.sessionId === peer.claudeSessionId)?.pid;
-    const disposition: PeerDisposition = !agent
-      ? "gone"
-      : isFinished(agent)
-        ? "finished"
-        : pid === undefined
-          ? "gone"
-          : agent.state === "blocked"
-            ? "stuck"
-            : "working";
-    health.push({
+  const agents = await inventory(process);
+  const facts = await reconcileSessions({
+    sessionIds: peers.flatMap((peer) =>
+      peer.claudeSessionId ? [peer.claudeSessionId] : [],
+    ),
+    agents,
+    runner: process,
+  });
+  return peers.map((peer) => {
+    const session = peer.claudeSessionId
+      ? facts.get(peer.claudeSessionId)
+      : undefined;
+    const agent = agents.find(
+      (entry) => entry.sessionId === peer.claudeSessionId,
+    );
+    return {
       peer,
-      disposition,
+      disposition: session?.disposition ?? "gone",
       ...(agent ? { agent } : {}),
-      ...(pid !== undefined ? { pid } : {}),
-    });
-  }
-  const sizes = await residentMb(
-    health.flatMap((entry) => (entry.pid === undefined ? [] : [entry.pid])),
-    process,
-  );
-  return health.map((entry) => ({
-    ...entry,
-    ...(entry.pid !== undefined && sizes.has(entry.pid)
-      ? { residentMb: sizes.get(entry.pid) as number }
-      : {}),
-  }));
-}
-
-// A pid is only killed after the session registry confirms it still belongs to
-// the session being closed: pids are reused, and this one came from a file.
-async function killVerified(
-  pid: number,
-  sessionId: string,
-  signal: string,
-): Promise<boolean> {
-  const owner = (await listClaudeSessions()).find(
-    (session) => session.pid === pid,
-  );
-  if (!owner || owner.sessionId !== sessionId) return false;
-  try {
-    process.kill(pid, signal as NodeJS.Signals);
-    return true;
-  } catch {
-    return false;
-  }
+      ...(session ? { facts: session } : {}),
+      ...(session?.pid !== undefined ? { pid: session.pid } : {}),
+      ...(session?.residentMb !== undefined
+        ? { residentMb: session.residentMb }
+        : {}),
+    };
+  });
 }
 
 async function removeWorktree(
@@ -133,9 +90,9 @@ async function removeWorktree(
       await rm(cwd, { recursive: true, force: true });
       return `deleted worktree directory ${cwd}`;
     } catch (removeError) {
-      return `could not remove worktree ${cwd}: ${
-        gitError instanceof Error ? gitError.message : "git failed"
-      }; ${removeError instanceof Error ? removeError.message : "delete failed"}`;
+      return `could not remove worktree ${cwd}: ${errorMessage(
+        gitError,
+      )}; ${errorMessage(removeError)}`;
     }
   }
 }
@@ -177,9 +134,7 @@ async function forgetRouting(
     await forgetState(gitCommonDir, peer.claudeSessionId);
     return `forgot routing state for ${peer.claudeSessionId}`;
   } catch (error) {
-    return `could not forget routing state for ${peer.claudeSessionId}: ${
-      error instanceof Error ? error.message : "unknown"
-    }`;
+    return `could not forget routing state for ${peer.claudeSessionId}: ${errorMessage(error)}`;
   }
 }
 
@@ -191,6 +146,10 @@ export interface CloseOptions {
   removeWorktree?: boolean;
   process?: ProcessRunner;
   home?: string;
+  settleMs?: number;
+  attemptMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  kill?: Signaller;
 }
 
 export interface CloseResult {
@@ -198,35 +157,52 @@ export interface CloseResult {
   actions: string[];
 }
 
+/**
+ * Stops the session and only then forgets it. Nothing the bridge recorded is
+ * deleted until the session is proved to have stopped and stayed stopped:
+ * forgetting a worker the daemon can still revive leaves a writer nobody is
+ * tracking in a worktree the bridge believes is free.
+ */
 export async function closePeer(input: CloseOptions): Promise<CloseResult> {
   const runner = input.process ?? nativeProcessRunner;
   const peer = await findPeer(input.reference, input.home);
   if (!peer) throw new Error(`no peer matches ${input.reference}`);
   const actions: string[] = [];
-  const survey = (await surveyPeers(runner, input.home)).find(
-    (entry) => entry.peer.id === peer.id,
-  );
-  if (survey?.pid !== undefined && peer.claudeSessionId) {
+  if (peer.claudeSessionId) {
+    const survey = (await surveyPeers(runner, input.home)).find(
+      (entry) => entry.peer.id === peer.id,
+    );
     // Only a session that has not ended can lose unsaved work to a signal; a
     // finished one is a host process still holding memory.
     if (
       !input.force &&
-      (survey.disposition === "working" || survey.disposition === "stuck")
+      (survey?.disposition === "working" || survey?.disposition === "stuck")
     ) {
-      throw new Error(
+      throw new BridgeError(
+        "session_still_running",
         `session ${peer.claudeSessionId} is still ${survey.disposition} (pid ${survey.pid}, ${survey.residentMb ?? "?"} MB). Pass --force to stop it`,
       );
     }
-    const stopped = await killVerified(
-      survey.pid,
-      peer.claudeSessionId,
-      "SIGTERM",
-    );
-    actions.push(
-      stopped
-        ? `stopped claude session ${peer.claudeSessionId} (pid ${survey.pid})`
-        : `could not stop pid ${survey.pid}; it no longer matches the session`,
-    );
+    const outcome = await stopSession({
+      sessionId: peer.claudeSessionId,
+      inventory: () => inventory(runner),
+      runner,
+      ...(input.settleMs !== undefined ? { settleMs: input.settleMs } : {}),
+      ...(input.attemptMs !== undefined ? { attemptMs: input.attemptMs } : {}),
+      ...(input.sleep ? { sleep: input.sleep } : {}),
+      ...(input.kill ? { kill: input.kill } : {}),
+    });
+    actions.push(...outcome.actions);
+    if (!outcome.stopped) {
+      throw new BridgeError(
+        "termination_unconfirmed",
+        `could not confirm session ${peer.claudeSessionId} stopped${
+          outcome.survivors.length
+            ? ` (pid ${outcome.survivors.join(", ")} still alive)`
+            : ""
+        }; routing state, worktree and peer link were left in place. Actions: ${actions.join("; ")}`,
+      );
+    }
   }
   const forgotten = await forgetRouting(peer, runner);
   if (forgotten) actions.push(forgotten);
@@ -239,9 +215,7 @@ export async function closePeer(input: CloseOptions): Promise<CloseResult> {
       await runner.run(["codex", "archive", peer.codexThreadId]);
       actions.push(`archived codex thread ${peer.codexThreadId}`);
     } catch (error) {
-      actions.push(
-        `codex archive failed: ${error instanceof Error ? error.message : "unknown"}`,
-      );
+      actions.push(`codex archive failed: ${errorMessage(error)}`);
     }
   }
   await unlinkPeer(peer.id, input.home);
@@ -255,6 +229,10 @@ export interface ReapOptions {
   killStuck?: boolean;
   process?: ProcessRunner;
   home?: string;
+  settleMs?: number;
+  attemptMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  kill?: Signaller;
 }
 
 export interface ReapResult {
@@ -262,21 +240,26 @@ export interface ReapResult {
   reclaimedMb: number;
   survey: PeerHealth[];
   actions: string[];
+  /** Peers the sweep could not finish, which is what makes it exit non-zero. */
+  unresolved: string[];
+}
+
+function reapable(entry: PeerHealth, killStuck: boolean): boolean {
+  if (entry.disposition === "stuck") return killStuck;
+  if (entry.facts && isActive(entry.facts)) return false;
+  return entry.disposition === "gone" || entry.disposition === "finished";
 }
 
 /**
- * Sweeps collaborations whose Claude session has finished or died, and optionally
- * stops ones wedged on a permission prompt. Reports without changing anything
- * unless asked, because stopping a session discards its unsaved work.
+ * Sweeps collaborations whose Claude session has ended, and optionally stops
+ * ones wedged on a permission prompt. Reports without changing anything unless
+ * asked, because stopping a session discards its unsaved work.
  */
 export async function reapPeers(input: ReapOptions = {}): Promise<ReapResult> {
   const runner = input.process ?? nativeProcessRunner;
   const survey = await surveyPeers(runner, input.home);
-  const prunable = survey.filter(
-    (entry) =>
-      entry.disposition === "gone" ||
-      entry.disposition === "finished" ||
-      (input.killStuck && entry.disposition === "stuck"),
+  const prunable = survey.filter((entry) =>
+    reapable(entry, input.killStuck === true),
   );
   const reclaimedMb = prunable.reduce(
     (total, entry) => total + (entry.residentMb ?? 0),
@@ -291,9 +274,11 @@ export async function reapPeers(input: ReapOptions = {}): Promise<ReapResult> {
         (entry) =>
           `would close ${entry.peer.id} (${entry.disposition}${entry.residentMb ? `, ${entry.residentMb} MB` : ""})`,
       ),
+      unresolved: [],
     };
   }
   const actions: string[] = [];
+  const unresolved: string[] = [];
   for (const entry of prunable) {
     try {
       const result = await closePeer({
@@ -302,13 +287,18 @@ export async function reapPeers(input: ReapOptions = {}): Promise<ReapResult> {
         removeWorktree: true,
         process: runner,
         ...(input.home ? { home: input.home } : {}),
+        ...(input.settleMs !== undefined ? { settleMs: input.settleMs } : {}),
+        ...(input.attemptMs !== undefined
+          ? { attemptMs: input.attemptMs }
+          : {}),
+        ...(input.sleep ? { sleep: input.sleep } : {}),
+        ...(input.kill ? { kill: input.kill } : {}),
       });
       actions.push(...result.actions);
     } catch (error) {
-      actions.push(
-        `could not close ${entry.peer.id}: ${error instanceof Error ? error.message : "unknown"}`,
-      );
+      unresolved.push(entry.peer.id);
+      actions.push(`could not close ${entry.peer.id}: ${errorMessage(error)}`);
     }
   }
-  return { applied: true, reclaimedMb, survey, actions };
+  return { applied: true, reclaimedMb, survey, actions, unresolved };
 }

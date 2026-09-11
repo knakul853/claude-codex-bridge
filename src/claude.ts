@@ -6,6 +6,7 @@ import {
   parseSessionId,
   withHandoverContract,
 } from "./contracts";
+import { BridgeError } from "./errors";
 import { linkPeer, listPeers } from "./peers";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
 import { type RepositoryState, readRepositoryState } from "./repository";
@@ -21,6 +22,7 @@ import {
   saveManifest,
   writeManifest,
 } from "./state";
+import { isActive, reconcileSessions, worktreeOwner } from "./supervision";
 
 export interface AgentRecord {
   id?: string;
@@ -71,10 +73,6 @@ export function isLive(agent: AgentRecord): boolean {
   return agent.pid !== undefined;
 }
 
-export function isFinished(agent: AgentRecord): boolean {
-  return ["done", "stopped", "failed"].includes(agent.state ?? "");
-}
-
 function samePath(left: string, right: string): boolean {
   return resolve(left) === resolve(right);
 }
@@ -85,11 +83,22 @@ async function inventory(process: ProcessRunner): Promise<AgentRecord[]> {
   );
 }
 
+// biome-ignore lint/suspicious/noControlCharactersInRegex: the escape is the point.
+const ANSI = /\u001B\[[0-9;]*[A-Za-z]/g;
+
+function stripAnsi(value: string): string {
+  return value.replace(ANSI, "");
+}
+
 async function launchedAgent(
   process: ProcessRunner,
   stdout: string,
 ): Promise<AgentRecord> {
-  const shortId = stdout.match(/backgrounded\s+·\s+([0-9a-f]{8})\b/i)?.[1];
+  // FORCE_COLOR makes Claude colourise even a piped launch, and an unparsed
+  // launch leaves a worker running that the bridge never records.
+  const shortId = stripAnsi(stdout).match(
+    /backgrounded\s+·\s+([0-9a-f]{8})\b/i,
+  )?.[1];
   if (!shortId)
     throw new Error("Claude did not report the background session id");
   const matches = (await inventory(process)).filter(
@@ -131,14 +140,43 @@ export const DEFAULT_LIVE_WORKER_LIMIT = 4;
 export async function liveBridgeWorkers(
   process: ProcessRunner = nativeProcessRunner,
   home?: string,
+  agents?: AgentRecord[],
 ): Promise<AgentRecord[]> {
   const sessions = new Set(
     (await listPeers(home))
       .map((link) => link.claudeSessionId)
       .filter((id): id is string => id !== undefined),
   );
-  return (await inventory(process)).filter(
+  return (agents ?? (await inventory(process))).filter(
     (agent) => sessions.has(agent.sessionId) && isLive(agent),
+  );
+}
+
+/**
+ * Two bridge workers in one working tree are two writers on the same files, and
+ * the second one arrives believing the tree is its own. A worker that is still
+ * running, or whose background lease the daemon never settled, keeps the tree.
+ */
+async function requireFreeWorktree(
+  cwd: string,
+  agents: AgentRecord[],
+  process: ProcessRunner,
+  home?: string,
+): Promise<void> {
+  const owner = await worktreeOwner({
+    cwd,
+    agents,
+    runner: process,
+    ...(home ? { home } : {}),
+  });
+  if (!owner) return;
+  throw new BridgeError(
+    "worktree_owner_active",
+    `session ${owner.facts.sessionId} already owns ${cwd} (${owner.facts.disposition}${
+      owner.facts.pid === undefined
+        ? ", no process"
+        : `, pid ${owner.facts.pid}`
+    }, native state "${owner.facts.state ?? "unknown"}"). Close it with \`claude-codex-bridge close --peer ${owner.peer.id} --force\` and wait for that to confirm, or start the worker in another worktree`,
   );
 }
 
@@ -176,8 +214,18 @@ export async function startJob(input: StartOptions): Promise<BridgeManifest> {
       "Claude completion hooks are not installed; run `claude-codex-bridge install-hooks`",
     );
   }
+  const agents = await inventory(process);
+  // A fresh worktree has no owner by construction; --here shares a tree that may
+  // already have one.
+  if (input.here)
+    await requireFreeWorktree(
+      input.repository.root,
+      agents,
+      process,
+      input.home,
+    );
   const limit = input.liveWorkerLimit ?? DEFAULT_LIVE_WORKER_LIMIT;
-  const live = await liveBridgeWorkers(process, input.home);
+  const live = await liveBridgeWorkers(process, input.home, agents);
   if (live.length >= limit) {
     throw new Error(
       `${live.length} bridge workers are already live (limit ${limit}). Close one with \`claude-codex-bridge close\`, or raise --max-live`,
@@ -225,13 +273,8 @@ export async function startJob(input: StartOptions): Promise<BridgeManifest> {
   return manifest;
 }
 
-async function exactAgent(
-  process: ProcessRunner,
-  sessionId: string,
-): Promise<AgentRecord> {
-  const matches = (await inventory(process)).filter(
-    (agent) => agent.sessionId === sessionId,
-  );
+function exactAgent(agents: AgentRecord[], sessionId: string): AgentRecord {
+  const matches = agents.filter((agent) => agent.sessionId === sessionId);
   if (matches.length !== 1 || !matches[0]) {
     throw new Error(
       "Claude session must have exactly one full-session-id match",
@@ -253,7 +296,8 @@ export async function continueJob(input: {
   const manifest = await loadManifest(input.gitCommonDir, id);
   if (!manifest)
     throw new Error("bridge manifest was not found for this session");
-  const agent = await exactAgent(process, id);
+  const agents = await inventory(process);
+  const agent = exactAgent(agents, id);
   // An interactive session cannot be resumed in place: --resume --bg would fork a
   // second process against the same transcript. Reaching it means the inbox.
   if (isInteractive(agent)) {
@@ -267,6 +311,10 @@ export async function continueJob(input: {
     );
   }
   await requireRepositoryBinding(process, agent.cwd, manifest.gitCommonDir);
+  // The resumed worker lands in this tree, so anything still writing there —
+  // including this session under a state label written before it went back to
+  // work — has to be settled first.
+  await requireFreeWorktree(agent.cwd, agents, process, input.home);
   const launch = await process.run(
     ["claude", "--resume", id, "--bg", withHandoverContract(input.prompt)],
     {
@@ -336,7 +384,7 @@ export async function requestReview(input: {
   const process = input.process ?? nativeProcessRunner;
   const codex = input.codex ?? new NativeCodexReviewClient(process);
   const id = parseSessionId(input.sessionId);
-  const agent = await exactAgent(process, id);
+  const agent = exactAgent(await inventory(process), id);
   const worktree = await readRepositoryState(agent.cwd, process);
   if (!samePath(worktree.commonDir, input.repository.commonDir)) {
     throw new Error("Claude session belongs to another repository");
@@ -406,15 +454,17 @@ export async function forgetJob(input: {
   if (!(await loadManifest(input.gitCommonDir, id))) {
     throw new Error("bridge manifest was not found for this session");
   }
-  const matches = (await inventory(process)).filter(
-    (agent) => agent.sessionId === id,
-  );
+  const agents = await inventory(process);
+  const matches = agents.filter((agent) => agent.sessionId === id);
   if (matches.length > 1) {
     throw new Error("Claude session matches more than one inventory record");
   }
   const agent = matches[0];
   if (agent) {
-    if (!isFinished(agent)) {
+    const facts = (
+      await reconcileSessions({ sessionIds: [id], agents, runner: process })
+    ).get(id);
+    if (facts && isActive(facts)) {
       throw new Error("forget refuses a live or blocked session");
     }
     await requireRepositoryBinding(process, agent.cwd, input.gitCommonDir);

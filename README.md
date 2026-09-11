@@ -121,6 +121,12 @@ claude-codex-bridge start --owner-thread <id> --cwd /path/to/repo --here
 tree. `--here` runs the worker in the repo itself and allows a dirty one, which is
 what a reviewer needs in order to see uncommitted work.
 
+One worker owns a working tree at a time. `start --here` and `continue` refuse
+while another worker is still writing there, or while its background lease is
+unsettled and could be revived into one, rather than putting a second writer on the
+same files. The refusal prints `{"code":"worktree_owner_active", ...}` on stderr
+and exits 5, naming the peer to close first.
+
 ### Closing things down
 
 Each Claude session holds a few hundred megabytes plus its own MCP children, and a
@@ -136,11 +142,22 @@ claude-codex-bridge close --peer <ref> --force --remove-worktree --archive-threa
 
 `reap` reports unless `--apply` is passed, because stopping a session discards its
 unsaved work; a session whose native state says it ended has none left to lose, so
-only a working or blocked one needs `--force`. A pid is signalled only after the
-session registry confirms it still belongs to that session, since pids are reused
-and this one came from a file. Only worktrees the bridge cut itself are ever
-removed. Both verbs drop the routing state with the pairing, so nothing is left
-behind to clean up by hand.
+only a working or blocked one needs `--force`. A native state label is reconciled
+against the session registry and the operating system before it is believed: a busy
+worker under a `failed` label is still working, and a `working` label over no
+process at all is a lease the daemon can still revive.
+
+Closing asks Claude to stop the session first, which releases that lease. A worker
+killed by signal alone leaves the lease unsettled, and the daemon revives it later.
+Nothing the bridge recorded is deleted until the session is proved to have stopped
+and stayed stopped: no surviving process, a settled lease, and neither of them back
+during a quiet period. An unconfirmed stop keeps the routing state, the worktree
+and the pairing, reports `{"code":"termination_unconfirmed", ...}` and exits 5;
+`reap` lists what it could not close under `unresolved` and exits 6. A pid is
+signalled only after the session registry confirms it still belongs to that session
+and the operating system confirms it is a Claude process, since pids are reused and
+this one came from a file; the host process that would restart the worker is
+signalled before the worker. Only worktrees the bridge cut itself are ever removed.
 
 `forget` removes routing state on its own, for a session closed before the bridge
 did that itself:

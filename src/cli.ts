@@ -11,6 +11,7 @@ import {
   startJob,
 } from "./claude";
 import { NativeCodexReviewClient } from "./codex";
+import { BridgeError } from "./errors";
 import { runHook } from "./hook";
 import {
   inboxLanePath,
@@ -271,12 +272,14 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "reap") {
-    emit(
-      await reapPeers({
-        apply: flag("--apply"),
-        killStuck: flag("--kill-stuck"),
-      }),
-    );
+    const result = await reapPeers({
+      apply: flag("--apply"),
+      killStuck: flag("--kill-stuck"),
+    });
+    emit(result);
+    // A sweep that could not stop something has left it running; saying so in
+    // the exit code is what stops a caller from treating it as clean.
+    if (result.unresolved.length > 0) process.exitCode = 6;
     return;
   }
   if (command === "projects") {
@@ -442,6 +445,15 @@ async function main(): Promise<void> {
 
 if (import.meta.main) {
   main().catch((error) => {
+    // A refusal Codex can act on is machine-readable: the code says which
+    // refusal it was without the caller parsing the sentence.
+    if (error instanceof BridgeError) {
+      process.stderr.write(
+        `${JSON.stringify({ ok: false, code: error.code, error: error.message })}\n`,
+      );
+      process.exitCode = 5;
+      return;
+    }
     process.stderr.write(
       `${error instanceof Error ? error.message : "bridge failed"}\n`,
     );
