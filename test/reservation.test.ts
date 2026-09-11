@@ -48,9 +48,9 @@ test("keys the reservation by repository and worktree path", async () => {
   });
 });
 
-// Otherwise a start that crashed between claiming and publishing would leave the
-// tree reserved until someone deleted a file by hand.
-test("ignores a contender whose holder is gone from this machine", async () => {
+// A holder proved gone can neither publish nor release, which is the only case
+// where replacing it is safe rather than a guess.
+test("supersedes a holder proved gone from this machine", async () => {
   const root = await home();
   await reserveWorktree({ ...tree, home: root, pid: 4242, host: "here" });
   const retaken = await reserveWorktree({
@@ -62,9 +62,9 @@ test("ignores a contender whose holder is gone from this machine", async () => {
   expect(retaken).toBeDefined();
 });
 
-// A pid means nothing on a machine that did not write it, so age is the only
-// bound left; it is what stops a crash elsewhere from holding the tree forever.
-test("ignores a contender older than its bounded lifetime", async () => {
+// A pid means nothing on a machine that did not write it, so age alone never
+// takes the tree away: age changes what the refusal says, not whether it refuses.
+test("refuses a holder it cannot prove abandoned, however old", async () => {
   const root = await home();
   const start = Date.parse("2026-09-11T00:00:00.000Z");
   await reserveWorktree({
@@ -73,26 +73,27 @@ test("ignores a contender older than its bounded lifetime", async () => {
     host: "elsewhere",
     now: () => start,
   });
-  const early = (await reserveWorktree({
-    ...tree,
-    home: root,
-    host: "here",
-    alive: () => true,
-    now: () => start + RESERVATION_TTL_MS - 1,
-  }).catch((reason: unknown) => reason)) as BridgeError;
+  const contend = (when: number) =>
+    reserveWorktree({
+      ...tree,
+      home: root,
+      host: "here",
+      alive: () => true,
+      now: () => when,
+    }).catch((reason: unknown) => reason) as Promise<BridgeError>;
+
+  const early = await contend(start + RESERVATION_TTL_MS - 1);
   expect(early.code).toBe("worktree_owner_active");
-  await reserveWorktree({
-    ...tree,
-    home: root,
-    host: "here",
-    alive: () => true,
-    now: () => start + RESERVATION_TTL_MS,
-  });
+  expect(early.message).toContain("already publishing");
+
+  const late = await contend(start + RESERVATION_TTL_MS);
+  expect(late.code).toBe("worktree_owner_active");
+  expect(late.message).toContain("cannot be proved");
 });
 
-// An abandoned contender releasing late must not take the elected holder away
-// with it, or the tree would read as free while a publication is still running.
-test("releasing an abandoned contender leaves the elected holder alone", async () => {
+// A superseded holder releasing late must not take the new holder away with it,
+// or the tree would read as free while a publication is still running.
+test("releasing a superseded hold leaves the new holder alone", async () => {
   const root = await home();
   const abandoned = await reserveWorktree({
     ...tree,
@@ -113,16 +114,18 @@ test("releasing an abandoned contender leaves the elected holder alone", async (
   expect(error.code).toBe("worktree_owner_active");
 });
 
-// Taking over an abandoned tree used to be read, remove, claim, so two commands
-// reclaiming at once both won and the later one deleted the winner's
-// reservation. Only separate processes interleave the way that needs.
-test("elects one winner when several processes reclaim one abandoned tree", async () => {
+// Contenders used to decide from their own snapshot of the directory, so one
+// could scan before another existed and both declare themselves the holder.
+// Ownership is now a single exclusive create, which only separate processes can
+// contend for the way a second bridge command does.
+test("lets one of several processes supersede an abandoned holder", async () => {
   const root = await home();
-  await reserveWorktree({
-    ...tree,
-    home: root,
-    now: () => Date.parse("2026-09-01T00:00:00.000Z"),
-  });
+  // A holder whose process is provably gone, which is the only kind that may be
+  // superseded at all.
+  const departed = Bun.spawn(["true"], { stdout: "ignore", stderr: "ignore" });
+  await departed.exited;
+  await reserveWorktree({ ...tree, home: root, pid: departed.pid });
+
   const barrier = join(root, "go");
   const script = join(root, "reclaim.ts");
   await Bun.write(
@@ -133,10 +136,9 @@ test("elects one winner when several processes reclaim one abandoned tree", asyn
       `while (!(await Bun.file(${JSON.stringify(barrier)}).exists())) await Bun.sleep(2);`,
       "try {",
       `  await reserveWorktree({ ...${JSON.stringify(tree)}, home: ${JSON.stringify(root)} });`,
-      // Hold it the way a publication would, so a loser that deleted the
-      // winner's file shows up as a second winner.
-      "  await Bun.sleep(1500);",
-      '  console.log("WON");',
+      // No release and no wait: the hold is a file, so a second winner would
+      // still be a second winner however the processes are scheduled.
+      '  console.log("HELD");',
       "} catch {",
       '  console.log("REFUSED");',
       "}",
@@ -149,8 +151,8 @@ test("elects one winner when several processes reclaim one abandoned tree", asyn
       stdin: "ignore",
     }),
   );
-  // Every reclaimer has to be waiting on the barrier before it opens, or a late
-  // one would contend with a tree the winner has already released again.
+  // Every contender has to be waiting on the barrier before it opens, so they
+  // all reach the takeover together.
   while (
     (await readdir(root)).filter((name) => name.startsWith("ready.")).length <
     children.length
@@ -165,5 +167,5 @@ test("elects one winner when several processes reclaim one abandoned tree", asyn
       return text.trim();
     }),
   );
-  expect(results.filter((line) => line === "WON")).toHaveLength(1);
+  expect(results.filter((line) => line === "HELD")).toHaveLength(1);
 });

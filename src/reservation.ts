@@ -11,13 +11,15 @@ import {
 } from "./store";
 
 /**
- * How long a contender is believed once its holder can no longer be checked.
- * Longer than any launch takes, short enough that a crash on another machine
- * frees the tree again without anyone deleting a file by hand.
+ * When a holder stops looking like it is still publishing. Past this it is
+ * reported as abandoned, but it is only ever superseded on evidence: age alone
+ * never takes a worktree away from whatever might still be writing to it.
  */
 export const RESERVATION_TTL_MS = 10 * 60_000;
 
-interface Contender {
+const OWNER = "owner.json";
+
+interface Owner {
   schemaVersion: 1;
   token: string;
   cwd: string;
@@ -25,11 +27,6 @@ interface Contender {
   pid: number;
   host: string;
   acquiredAt: string;
-}
-
-interface Candidate {
-  path: string;
-  record?: Contender;
 }
 
 export interface WorktreeReservation {
@@ -56,7 +53,7 @@ function reservationDirectory(input: ReserveOptions): string {
   return join(input.home ?? bridgeHome(), "reservations", hash.digest("hex"));
 }
 
-function parseContender(value: unknown): Contender | undefined {
+function parseOwner(value: unknown): Owner | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return;
   const record = value as Record<string, unknown>;
   if (
@@ -81,26 +78,35 @@ function parseContender(value: unknown): Contender | undefined {
   };
 }
 
-async function readCandidates(directory: string): Promise<Candidate[]> {
-  const candidates: Candidate[] = [];
-  const glob = new Bun.Glob("*.json");
+type Current =
+  | { kind: "free" }
+  | { kind: "held"; owner: Owner }
+  | { kind: "unreadable" };
+
+async function read(path: string): Promise<Current> {
   try {
-    for await (const name of glob.scan({ cwd: directory, onlyFiles: true })) {
-      const path = join(directory, name);
-      try {
-        const record = parseContender(JSON.parse(await safeRead(path)));
-        candidates.push({ path, ...(record ? { record } : {}) });
-      } catch (error) {
-        // A file that vanished between the scan and the read is simply gone; a
-        // file that will not parse cannot be a live holder, because a holder's
-        // own file is linked into place whole.
-        if (!absent(error)) candidates.push({ path });
-      }
-    }
+    const owner = parseOwner(JSON.parse(await safeRead(path)));
+    return owner ? { kind: "held", owner } : { kind: "unreadable" };
   } catch (error) {
-    if (!absent(error)) throw error;
+    if (absent(error)) return { kind: "free" };
+    return { kind: "unreadable" };
   }
-  return candidates;
+}
+
+/**
+ * The whole of the mutual exclusion. `atomicCreate` links the file into place,
+ * so the kernel decides who gets it; nobody has to agree about what a directory
+ * looked like at some moment.
+ */
+async function claim(path: string, owner: Owner): Promise<boolean> {
+  try {
+    await atomicCreate(path, owner);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "EEXIST")
+      return false;
+    throw error;
+  }
 }
 
 function running(pid: number): boolean {
@@ -114,42 +120,56 @@ function running(pid: number): boolean {
 }
 
 /**
- * A contender counts only until one of two things is true: the process that
- * wrote it is gone, which is only evidence on the machine that wrote it, or it
- * is older than the time any publication can take. Both bounds exist so a
- * crashed start cannot leave a worktree reserved forever.
+ * Whether the holder can be proved gone rather than merely assumed gone. Only
+ * the machine that recorded a pid can judge it, and a holder proved gone can
+ * neither publish nor release, which is what makes superseding it safe. Anything
+ * else — another host, a pid that answers, a record that will not parse — is
+ * refused instead, and cleaned up deliberately rather than raced for.
  */
-function expired(
-  record: Contender,
-  now: number,
+function provablyAbandoned(
+  owner: Owner,
   host: string,
   alive: (pid: number) => boolean,
 ): boolean {
-  const age = now - Date.parse(record.acquiredAt);
-  if (!Number.isFinite(age) || age >= RESERVATION_TTL_MS) return true;
-  return record.host === host && !alive(record.pid);
+  return owner.host === host && !alive(owner.pid);
 }
 
-/**
- * Every contender orders the same files the same way, so they all elect the same
- * holder without any of them writing to another's file. The comparison is on
- * code units rather than through a collator: an election has to come out
- * identically in every process, whatever locale it was started in.
- */
-function earlierThan(left: Contender, right: Contender): number {
-  if (left.acquiredAt !== right.acquiredAt)
-    return left.acquiredAt < right.acquiredAt ? -1 : 1;
-  return left.token < right.token ? -1 : 1;
+function stale(owner: Owner, now: number): boolean {
+  const age = now - Date.parse(owner.acquiredAt);
+  return !Number.isFinite(age) || age >= RESERVATION_TTL_MS;
 }
 
-function refuse(cwd: string, winner: Contender | undefined): never {
-  const holder = winner
-    ? `pid ${winner.pid} on ${winner.host} has held it since ${winner.acquiredAt}`
-    : "another process holds it";
+function refuse(input: {
+  cwd: string;
+  path: string;
+  current: Current;
+  now: number;
+}): never {
+  const held = input.current.kind === "held" ? input.current.owner : undefined;
+  const abandoned =
+    input.current.kind === "unreadable" ||
+    (held !== undefined && stale(held, input.now));
+  const holder = held
+    ? `pid ${held.pid} on ${held.host} has held it since ${held.acquiredAt}`
+    : "its record cannot be read";
   throw new BridgeError(
     "worktree_owner_active",
-    `another bridge start or continue is already publishing a worker for ${cwd} (${holder}). Let it finish and read \`claude-codex-bridge peers\`, or use a different worktree`,
+    abandoned
+      ? `a bridge reservation for ${input.cwd} looks abandoned but cannot be proved so (${holder}), and it is never taken away on a guess. Check \`claude-codex-bridge peers\`, then delete ${input.path} once you know nothing is publishing there`
+      : `another bridge start or continue is already publishing a worker for ${input.cwd} (${holder}). Let it finish and read \`claude-codex-bridge peers\`, or use a different worktree`,
   );
+}
+
+function holder(path: string, owner: Owner): WorktreeReservation {
+  return {
+    async release() {
+      // Only the holder lets go, and only of its own hold: a reservation that
+      // was superseded belongs to someone else now.
+      const current = await read(path);
+      if (current.kind === "held" && current.owner.token === owner.token)
+        await rm(path, { force: true });
+    },
+  };
 }
 
 /**
@@ -157,20 +177,22 @@ function refuse(cwd: string, winner: Contender | undefined): never {
  * reconciling who owns the tree and recording the worker that takes it cannot be
  * interleaved by a second start.
  *
- * Each contender creates only its own file and then elects a winner from what it
- * finds, which is what keeps a takeover safe: two commands reclaiming the same
- * abandoned tree agree on one winner instead of each deleting what it read and
- * claiming afterwards. Refuses immediately rather than waiting, because the
- * caller is a command someone is watching, not a queue.
+ * Ownership is one file that has to be created exclusively, which is the only
+ * step that decides anything; a reader's view of the directory never grants it.
+ * A holder proved gone is superseded through a second exclusive create keyed to
+ * that holder's own token, so exactly one contender may replace it and no
+ * contender ever removes a hold that might still be live. Refuses immediately
+ * rather than waiting, because the caller is a command someone is watching.
  */
 export async function reserveWorktree(
   input: ReserveOptions,
 ): Promise<WorktreeReservation> {
   const directory = reservationDirectory(input);
+  const path = join(directory, OWNER);
   const host = input.host ?? hostname();
   const alive = input.alive ?? running;
   const now = input.now ?? (() => Date.now());
-  const mine: Contender = {
+  const mine: Owner = {
     schemaVersion: 1,
     token: crypto.randomUUID(),
     cwd: resolve(input.cwd),
@@ -179,32 +201,51 @@ export async function reserveWorktree(
     host,
     acquiredAt: new Date(now()).toISOString(),
   };
-  const path = join(directory, `${mine.token}.json`);
   await ensurePrivateDirectory(directory);
-  await atomicCreate(path, mine);
-  const candidates = await readCandidates(directory);
-  const standing = candidates.filter(
-    (candidate) =>
-      candidate.record !== undefined &&
-      (candidate.record.token === mine.token ||
-        !expired(candidate.record, now(), host, alive)),
-  );
-  const winner = standing
-    .map((candidate) => candidate.record as Contender)
-    .sort(earlierThan)[0];
-  if (winner?.token !== mine.token) {
+  if (await claim(path, mine)) return holder(path, mine);
+
+  const current = await read(path);
+  if (current.kind === "free") {
+    // Released between the attempt and the read. One more exclusive create,
+    // which is still the kernel deciding rather than us inferring.
+    if (await claim(path, mine)) return holder(path, mine);
+    return refuse({
+      cwd: input.cwd,
+      path,
+      current: await read(path),
+      now: now(),
+    });
+  }
+  if (
+    current.kind !== "held" ||
+    !provablyAbandoned(current.owner, host, alive)
+  ) {
+    return refuse({ cwd: input.cwd, path, current, now: now() });
+  }
+
+  // The holder is gone, so it cannot come back to publish or release. This
+  // exclusive create is what picks the single contender allowed to replace it.
+  const supersede = join(directory, `takeover.${current.owner.token}.json`);
+  if (!(await claim(supersede, mine))) {
+    return refuse({ cwd: input.cwd, path, current, now: now() });
+  }
+  try {
+    const confirmed = await read(path);
+    if (
+      confirmed.kind !== "held" ||
+      confirmed.owner.token !== current.owner.token
+    ) {
+      return refuse({ cwd: input.cwd, path, current: confirmed, now: now() });
+    }
     await rm(path, { force: true });
-    refuse(input.cwd, winner);
+    if (await claim(path, mine)) return holder(path, mine);
+    return refuse({
+      cwd: input.cwd,
+      path,
+      current: await read(path),
+      now: now(),
+    });
+  } finally {
+    await rm(supersede, { force: true });
   }
-  // Only the elected holder tidies, and only what it proved abandoned, so no
-  // contender ever removes a file another one is still standing on.
-  for (const candidate of candidates) {
-    if (standing.includes(candidate)) continue;
-    await rm(candidate.path, { force: true });
-  }
-  return {
-    async release() {
-      await rm(path, { force: true });
-    },
-  };
 }

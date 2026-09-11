@@ -130,14 +130,21 @@ and exits 5, naming the peer to close first.
 Looking up that owner and recording the worker that takes the tree are separate
 steps, so both verbs first claim the tree under `<bridge home>/reservations`, keyed
 by the repository and the worktree path rather than any name, and hold it until the
-manifest and the pairing are written. Each command writes only its own contender
-file and then elects the earliest standing one, so two commands reclaiming the same
-abandoned tree agree on a single winner and neither can delete what the other is
-standing on. A command that loses removes its own file and is refused with the same
-code instead of queueing behind work it cannot see the end of. A contender stops
-counting once the process that wrote it is gone from the machine that wrote it, or
-after ten minutes, whichever comes first: a pid proves nothing on another host, so
-the clock is what keeps a crash from reserving a tree for good.
+manifest and the pairing are written. The claim is one `owner.json` that has to be
+created exclusively, so the kernel decides who holds it; no command infers
+ownership from what a directory looked like when it read it. A command that does
+not get the file is refused with the same code instead of queueing behind work it
+cannot see the end of.
+
+A hold is only ever superseded on evidence. When the recorded process is gone from
+the machine that recorded it, it can neither publish nor release, and one further
+exclusive create — keyed to that holder's own token — picks the single command
+allowed to replace it. Anything short of that proof is refused: another host, a pid
+that still answers, or a record that will not parse stays where it is however old
+it looks. Age only changes what the refusal says, and the message names the file to
+delete once you know nothing is publishing there. Bridge commands trade liveness
+for safety here on purpose — a worktree that stays reserved costs a `peers` check,
+while one taken away on a guess costs two writers in the same files.
 
 If publication fails after Claude has already started, the tree is not handed
 back on the way out. The worker is stopped and proved gone; failing that it is
