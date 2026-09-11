@@ -6,11 +6,11 @@ import {
   parseSessionId,
   withHandoverContract,
 } from "./contracts";
-import { BridgeError } from "./errors";
+import { BridgeError, errorMessage } from "./errors";
 import { linkPeer, listPeers } from "./peers";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
 import { type RepositoryState, readRepositoryState } from "./repository";
-import { reserveWorktree } from "./reservation";
+import { reserveWorktree, type WorktreeReservation } from "./reservation";
 import { redactText, truncateText } from "./safety";
 import {
   bridgeHooksInstalled,
@@ -23,7 +23,12 @@ import {
   saveManifest,
   writeManifest,
 } from "./state";
-import { isActive, reconcileSessions, worktreeOwner } from "./supervision";
+import {
+  isActive,
+  reconcileSessions,
+  stopSession,
+  worktreeOwner,
+} from "./supervision";
 
 export interface AgentRecord {
   id?: string;
@@ -181,6 +186,62 @@ async function requireFreeWorktree(
   );
 }
 
+interface Rescue {
+  /** Whether the tree may be handed back: nothing untracked is left in it. */
+  released: boolean;
+  detail: string;
+}
+
+/**
+ * A launch that could not be published leaves a worker in the tree that nothing
+ * is tracking. It is stopped and proved gone; failing that it is recorded as a
+ * peer, which owns the tree for longer than the reservation would and gives
+ * `close` something to act on. Only when neither works does the tree stay
+ * reserved, because handing it back would invite a second writer.
+ */
+async function rescueLaunch(input: {
+  agent: AgentRecord;
+  ownerThreadId: string;
+  gitCommonDir: string;
+  label?: string;
+  process: ProcessRunner;
+  home?: string;
+}): Promise<Rescue> {
+  const sessionId = input.agent.sessionId;
+  try {
+    const outcome = await stopSession({
+      sessionId,
+      inventory: () => inventory(input.process),
+      runner: input.process,
+    });
+    if (outcome.stopped) {
+      return {
+        released: true,
+        detail: `stopped the worker it had already started (${sessionId})`,
+      };
+    }
+    await linkPeer(
+      {
+        cwd: input.agent.cwd,
+        claudeSessionId: sessionId,
+        codexThreadId: input.ownerThreadId,
+        gitCommonDir: input.gitCommonDir,
+        ...(input.label ? { label: input.label } : {}),
+      },
+      input.home,
+    );
+    return {
+      released: true,
+      detail: `could not stop the worker it had already started (${sessionId}); recorded it as a peer so ${input.agent.cwd} keeps an owner, close it with \`claude-codex-bridge close --peer ${sessionId} --force\``,
+    };
+  } catch (error) {
+    return {
+      released: false,
+      detail: `the worker it had already started (${sessionId}) could neither be stopped nor recorded (${errorMessage(error)}); ${input.agent.cwd} stays reserved`,
+    };
+  }
+}
+
 export interface StartOptions {
   ownerThreadId: string;
   name?: string;
@@ -225,72 +286,101 @@ export async function startJob(input: StartOptions): Promise<BridgeManifest> {
         ...(input.home ? { home: input.home } : {}),
       })
     : undefined;
-  try {
-    return await publishWorker(input, process);
-  } finally {
-    await reservation?.release();
-  }
+  return publishWorker(input, process, reservation);
 }
 
 async function publishWorker(
   input: StartOptions,
   process: ProcessRunner,
+  reservation?: WorktreeReservation,
 ): Promise<BridgeManifest> {
-  const agents = await inventory(process);
-  if (input.here)
-    await requireFreeWorktree(
-      input.repository.root,
-      agents,
+  // Nothing is running before the launch, so an early refusal hands the tree
+  // straight back; once Claude has started, the worker decides that instead.
+  let agent: AgentRecord | undefined;
+  try {
+    const agents = await inventory(process);
+    if (input.here)
+      await requireFreeWorktree(
+        input.repository.root,
+        agents,
+        process,
+        input.home,
+      );
+    const limit = input.liveWorkerLimit ?? DEFAULT_LIVE_WORKER_LIMIT;
+    const live = await liveBridgeWorkers(process, input.home, agents);
+    if (live.length >= limit) {
+      throw new Error(
+        `${live.length} bridge workers are already live (limit ${limit}). Close one with \`claude-codex-bridge close\`, or raise --max-live`,
+      );
+    }
+    const worktreeName = `claude-codex-${crypto.randomUUID().slice(0, 8)}`;
+    const launch = await process.run(
+      [
+        "claude",
+        "--bg",
+        ...(input.here ? [] : ["--worktree", worktreeName]),
+        ...(input.permissionMode
+          ? ["--permission-mode", input.permissionMode]
+          : []),
+        ...(input.name ? ["--name", input.name] : []),
+        withHandoverContract(input.prompt),
+      ],
+      { cwd: input.repository.root },
+    );
+    agent = await launchedAgent(process, launch.stdout);
+    await requireRepositoryBinding(
       process,
+      agent.cwd,
+      input.repository.commonDir,
+    );
+    const manifest = parseManifest({
+      schemaVersion: 1,
+      sessionId: parseSessionId(agent.sessionId),
+      ownerThreadId: input.ownerThreadId,
+      ...(input.name ? { name: input.name } : {}),
+      gitCommonDir: input.repository.commonDir,
+      createdAt: (input.now ?? (() => new Date().toISOString()))(),
+    });
+    await writeManifest(manifest);
+    await linkPeer(
+      {
+        cwd: agent.cwd,
+        claudeSessionId: manifest.sessionId,
+        codexThreadId: manifest.ownerThreadId,
+        gitCommonDir: manifest.gitCommonDir,
+        ...(input.name ? { label: input.name } : {}),
+      },
       input.home,
     );
-  const limit = input.liveWorkerLimit ?? DEFAULT_LIVE_WORKER_LIMIT;
-  const live = await liveBridgeWorkers(process, input.home, agents);
-  if (live.length >= limit) {
-    throw new Error(
-      `${live.length} bridge workers are already live (limit ${limit}). Close one with \`claude-codex-bridge close\`, or raise --max-live`,
-    );
-  }
-  const worktreeName = `claude-codex-${crypto.randomUUID().slice(0, 8)}`;
-  const launch = await process.run(
-    [
-      "claude",
-      "--bg",
-      ...(input.here ? [] : ["--worktree", worktreeName]),
-      ...(input.permissionMode
-        ? ["--permission-mode", input.permissionMode]
-        : []),
-      ...(input.name ? ["--name", input.name] : []),
-      withHandoverContract(input.prompt),
-    ],
-    { cwd: input.repository.root },
-  );
-  const agent = await launchedAgent(process, launch.stdout);
-  await requireRepositoryBinding(
-    process,
-    agent.cwd,
-    input.repository.commonDir,
-  );
-  const manifest = parseManifest({
-    schemaVersion: 1,
-    sessionId: parseSessionId(agent.sessionId),
-    ownerThreadId: input.ownerThreadId,
-    ...(input.name ? { name: input.name } : {}),
-    gitCommonDir: input.repository.commonDir,
-    createdAt: (input.now ?? (() => new Date().toISOString()))(),
-  });
-  await writeManifest(manifest);
-  await linkPeer(
-    {
-      cwd: agent.cwd,
-      claudeSessionId: manifest.sessionId,
-      codexThreadId: manifest.ownerThreadId,
-      gitCommonDir: manifest.gitCommonDir,
+    await reservation?.release();
+    return manifest;
+  } catch (error) {
+    if (!agent) {
+      await reservation?.release();
+      throw error;
+    }
+    throw await unpublished(error, reservation, {
+      agent,
+      ownerThreadId: input.ownerThreadId,
+      gitCommonDir: input.repository.commonDir,
       ...(input.name ? { label: input.name } : {}),
-    },
-    input.home,
+      process,
+      ...(input.home ? { home: input.home } : {}),
+    });
+  }
+}
+
+async function unpublished(
+  error: unknown,
+  reservation: WorktreeReservation | undefined,
+  rescue: Parameters<typeof rescueLaunch>[0],
+): Promise<BridgeError> {
+  const outcome = await rescueLaunch(rescue);
+  if (outcome.released) await reservation?.release();
+  return new BridgeError(
+    "launch_unpublished",
+    `${errorMessage(error)}; ${outcome.detail}`,
   );
-  return manifest;
 }
 
 function exactAgent(agents: AgentRecord[], sessionId: string): AgentRecord {
@@ -336,11 +426,7 @@ export async function continueJob(input: {
     gitCommonDir: manifest.gitCommonDir,
     ...(input.home ? { home: input.home } : {}),
   });
-  try {
-    return await resumeWorker(input, process, manifest, agent);
-  } finally {
-    await reservation.release();
-  }
+  return resumeWorker(input, process, manifest, agent, reservation);
 }
 
 async function resumeWorker(
@@ -348,43 +434,64 @@ async function resumeWorker(
   process: ProcessRunner,
   manifest: BridgeManifest,
   agent: AgentRecord,
+  reservation: WorktreeReservation,
 ): Promise<BridgeManifest> {
-  const id = manifest.sessionId;
-  // Re-read under the reservation: anything still writing in this tree — a
-  // contender that published while we queued, or this session under a state
-  // label written before it went back to work — has to be settled first.
-  await requireFreeWorktree(
-    agent.cwd,
-    await inventory(process),
-    process,
-    input.home,
-  );
-  const launch = await process.run(
-    ["claude", "--resume", id, "--bg", withHandoverContract(input.prompt)],
-    {
-      cwd: agent.cwd,
-    },
-  );
-  const resumed = await launchedAgent(process, launch.stdout);
-  await requireRepositoryBinding(process, resumed.cwd, manifest.gitCommonDir);
-  if (resumed.sessionId === manifest.sessionId) return manifest;
-  const continuation = parseManifest({
-    ...manifest,
-    sessionId: parseSessionId(resumed.sessionId),
-    createdAt: (input.now ?? (() => new Date().toISOString()))(),
-  });
-  await writeManifest(continuation);
-  await linkPeer(
-    {
-      cwd: resumed.cwd,
-      claudeSessionId: continuation.sessionId,
-      codexThreadId: continuation.ownerThreadId,
-      gitCommonDir: continuation.gitCommonDir,
-      ...(continuation.name ? { label: continuation.name } : {}),
-    },
-    input.home,
-  );
-  return continuation;
+  let resumed: AgentRecord | undefined;
+  try {
+    const id = manifest.sessionId;
+    // Re-read under the reservation: anything still writing in this tree — a
+    // contender that published while we queued, or this session under a state
+    // label written before it went back to work — has to be settled first.
+    await requireFreeWorktree(
+      agent.cwd,
+      await inventory(process),
+      process,
+      input.home,
+    );
+    const launch = await process.run(
+      ["claude", "--resume", id, "--bg", withHandoverContract(input.prompt)],
+      {
+        cwd: agent.cwd,
+      },
+    );
+    resumed = await launchedAgent(process, launch.stdout);
+    await requireRepositoryBinding(process, resumed.cwd, manifest.gitCommonDir);
+    if (resumed.sessionId === manifest.sessionId) {
+      await reservation.release();
+      return manifest;
+    }
+    const continuation = parseManifest({
+      ...manifest,
+      sessionId: parseSessionId(resumed.sessionId),
+      createdAt: (input.now ?? (() => new Date().toISOString()))(),
+    });
+    await writeManifest(continuation);
+    await linkPeer(
+      {
+        cwd: resumed.cwd,
+        claudeSessionId: continuation.sessionId,
+        codexThreadId: continuation.ownerThreadId,
+        gitCommonDir: continuation.gitCommonDir,
+        ...(continuation.name ? { label: continuation.name } : {}),
+      },
+      input.home,
+    );
+    await reservation.release();
+    return continuation;
+  } catch (error) {
+    if (!resumed) {
+      await reservation.release();
+      throw error;
+    }
+    throw await unpublished(error, reservation, {
+      agent: resumed,
+      ownerThreadId: manifest.ownerThreadId,
+      gitCommonDir: manifest.gitCommonDir,
+      ...(manifest.name ? { label: manifest.name } : {}),
+      process,
+      ...(input.home ? { home: input.home } : {}),
+    });
+  }
 }
 
 function reviewMessage(input: {

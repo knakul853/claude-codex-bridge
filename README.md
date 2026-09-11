@@ -128,14 +128,24 @@ same files. The refusal prints `{"code":"worktree_owner_active", ...}` on stderr
 and exits 5, naming the peer to close first.
 
 Looking up that owner and recording the worker that takes the tree are separate
-steps, so both verbs first claim the tree in `<bridge home>/reservations`, keyed by
-the repository and the worktree path rather than any name, and hold it until the
-manifest and the pairing are written. A second command arriving in that window is
-refused with the same code instead of queueing behind it, and the claim is dropped
-whether the launch succeeds or fails. A claim left behind by a crash is taken over
-once the process that wrote it is gone from the machine that wrote it, or after ten
-minutes, whichever comes first: a pid proves nothing on another host, so the clock
-is what keeps a crash from reserving a tree for good.
+steps, so both verbs first claim the tree under `<bridge home>/reservations`, keyed
+by the repository and the worktree path rather than any name, and hold it until the
+manifest and the pairing are written. Each command writes only its own contender
+file and then elects the earliest standing one, so two commands reclaiming the same
+abandoned tree agree on a single winner and neither can delete what the other is
+standing on. A command that loses removes its own file and is refused with the same
+code instead of queueing behind work it cannot see the end of. A contender stops
+counting once the process that wrote it is gone from the machine that wrote it, or
+after ten minutes, whichever comes first: a pid proves nothing on another host, so
+the clock is what keeps a crash from reserving a tree for good.
+
+If publication fails after Claude has already started, the tree is not handed
+back on the way out. The worker is stopped and proved gone; failing that it is
+recorded as a pairing, which owns the tree for longer than a reservation would and
+gives `close` something to act on. Only if it can be neither stopped nor recorded
+does the tree stay reserved. Either way the command exits 5 with
+`{"code":"launch_unpublished", ...}` naming the session, rather than leaving a
+worker running that nothing is tracking.
 
 ### Closing things down
 

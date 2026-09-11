@@ -644,3 +644,73 @@ test("lets exactly one concurrent continuation resume into the worktree", async 
   expect(launched).toHaveLength(1);
   expect(refusals(results)).toEqual(["worktree_owner_active"]);
 });
+
+// A failure after the launch used to release the tree and walk away, leaving a
+// live worker nothing was tracking in a worktree that read as free.
+test("keeps a worktree owned when publication fails after Claude launched", async () => {
+  const repo = await repository("bridge-unpublished");
+  // The manifest the launch will try to write is already there.
+  await writeManifest({
+    schemaVersion: 1,
+    sessionId,
+    ownerThreadId: "owner-thread",
+    gitCommonDir: repo.commonDir,
+    createdAt: "2026-09-11T00:00:00.000Z",
+  });
+  const launched: string[] = [];
+  const runner: ProcessRunner = {
+    async run(argv) {
+      if (argv[1] === "--bg") {
+        launched.push("44444444");
+        return { stdout: "backgrounded · 44444444\n", stderr: "", exitCode: 0 };
+      }
+      if (argv[1] === "agents")
+        return {
+          stdout: JSON.stringify(
+            launched.map(() => ({
+              id: "44444444",
+              sessionId,
+              cwd: repo.root,
+              kind: "background",
+              // Still listed as working: the stop never settles it.
+              state: "working",
+            })),
+          ),
+          stderr: "",
+          exitCode: 0,
+        };
+      return { stdout: `${repo.commonDir}\n`, stderr: "", exitCode: 0 };
+    },
+  };
+  const request = () =>
+    startJob({
+      ownerThreadId: "owner-thread",
+      prompt: "work",
+      repository: {
+        root: repo.root,
+        commonDir: repo.commonDir,
+        branch: "main",
+        head: "c".repeat(40),
+        clean: false,
+        changedFiles: ["src/a.ts"],
+      },
+      here: true,
+      process: runner,
+      hooksReady: async () => true,
+      home: repo.home,
+    });
+
+  const failure = (await request().catch(
+    (reason: unknown) => reason,
+  )) as BridgeError;
+  expect(failure.code).toBe("launch_unpublished");
+  expect(launched).toHaveLength(1);
+  // The worker it could not stop is recorded, so the tree still has an owner.
+  expect(await listPeers(repo.home)).toHaveLength(1);
+
+  const second = (await request().catch(
+    (reason: unknown) => reason,
+  )) as BridgeError;
+  expect(second.code).toBe("worktree_owner_active");
+  expect(launched).toHaveLength(1);
+});

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BridgeError } from "../src/errors";
@@ -50,7 +50,7 @@ test("keys the reservation by repository and worktree path", async () => {
 
 // Otherwise a start that crashed between claiming and publishing would leave the
 // tree reserved until someone deleted a file by hand.
-test("breaks a reservation whose holder is gone from this machine", async () => {
+test("ignores a contender whose holder is gone from this machine", async () => {
   const root = await home();
   await reserveWorktree({ ...tree, home: root, pid: 4242, host: "here" });
   const retaken = await reserveWorktree({
@@ -64,7 +64,7 @@ test("breaks a reservation whose holder is gone from this machine", async () => 
 
 // A pid means nothing on a machine that did not write it, so age is the only
 // bound left; it is what stops a crash elsewhere from holding the tree forever.
-test("breaks a reservation older than its bounded lifetime", async () => {
+test("ignores a contender older than its bounded lifetime", async () => {
   const root = await home();
   const start = Date.parse("2026-09-11T00:00:00.000Z");
   await reserveWorktree({
@@ -90,9 +90,9 @@ test("breaks a reservation older than its bounded lifetime", async () => {
   });
 });
 
-// The loser of a break must not take the winner's reservation away on its way
-// out, or the tree would be free while a publication is still running.
-test("releasing a reservation that was broken leaves the new holder alone", async () => {
+// An abandoned contender releasing late must not take the elected holder away
+// with it, or the tree would read as free while a publication is still running.
+test("releasing an abandoned contender leaves the elected holder alone", async () => {
   const root = await home();
   const abandoned = await reserveWorktree({
     ...tree,
@@ -111,4 +111,59 @@ test("releasing a reservation that was broken leaves the new holder alone", asyn
     (reason: unknown) => reason,
   )) as BridgeError;
   expect(error.code).toBe("worktree_owner_active");
+});
+
+// Taking over an abandoned tree used to be read, remove, claim, so two commands
+// reclaiming at once both won and the later one deleted the winner's
+// reservation. Only separate processes interleave the way that needs.
+test("elects one winner when several processes reclaim one abandoned tree", async () => {
+  const root = await home();
+  await reserveWorktree({
+    ...tree,
+    home: root,
+    now: () => Date.parse("2026-09-01T00:00:00.000Z"),
+  });
+  const barrier = join(root, "go");
+  const script = join(root, "reclaim.ts");
+  await Bun.write(
+    script,
+    [
+      `import { reserveWorktree } from ${JSON.stringify(join(import.meta.dir, "../src/reservation.ts"))};`,
+      `await Bun.write(${JSON.stringify(join(root, "ready."))} + crypto.randomUUID(), "1");`,
+      `while (!(await Bun.file(${JSON.stringify(barrier)}).exists())) await Bun.sleep(2);`,
+      "try {",
+      `  await reserveWorktree({ ...${JSON.stringify(tree)}, home: ${JSON.stringify(root)} });`,
+      // Hold it the way a publication would, so a loser that deleted the
+      // winner's file shows up as a second winner.
+      "  await Bun.sleep(1500);",
+      '  console.log("WON");',
+      "} catch {",
+      '  console.log("REFUSED");',
+      "}",
+    ].join("\n"),
+  );
+  const children = [0, 1, 2, 3].map(() =>
+    Bun.spawn(["bun", "run", script], {
+      stdout: "pipe",
+      stderr: "ignore",
+      stdin: "ignore",
+    }),
+  );
+  // Every reclaimer has to be waiting on the barrier before it opens, or a late
+  // one would contend with a tree the winner has already released again.
+  while (
+    (await readdir(root)).filter((name) => name.startsWith("ready.")).length <
+    children.length
+  ) {
+    await Bun.sleep(10);
+  }
+  await Bun.write(barrier, "go");
+  const results = await Promise.all(
+    children.map(async (child) => {
+      const text = await new Response(child.stdout).text();
+      await child.exited;
+      return text.trim();
+    }),
+  );
+  expect(results.filter((line) => line === "WON")).toHaveLength(1);
 });

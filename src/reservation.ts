@@ -1,18 +1,23 @@
-import { constants } from "node:fs";
-import { open, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { hostname } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { BridgeError } from "./errors";
-import { absent, bridgeHome, ensurePrivateDirectory, safeRead } from "./store";
+import {
+  absent,
+  atomicCreate,
+  bridgeHome,
+  ensurePrivateDirectory,
+  safeRead,
+} from "./store";
 
 /**
- * How long a reservation is believed once its holder can no longer be checked.
+ * How long a contender is believed once its holder can no longer be checked.
  * Longer than any launch takes, short enough that a crash on another machine
  * frees the tree again without anyone deleting a file by hand.
  */
 export const RESERVATION_TTL_MS = 10 * 60_000;
 
-interface Reservation {
+interface Contender {
   schemaVersion: 1;
   token: string;
   cwd: string;
@@ -20,6 +25,11 @@ interface Reservation {
   pid: number;
   host: string;
   acquiredAt: string;
+}
+
+interface Candidate {
+  path: string;
+  record?: Contender;
 }
 
 export interface WorktreeReservation {
@@ -38,19 +48,15 @@ export interface ReserveOptions {
 
 // A working tree is identified by the repository it belongs to and its own
 // path, so a name, a label or a branch can change without moving the lock.
-function reservationPath(input: ReserveOptions): string {
+function reservationDirectory(input: ReserveOptions): string {
   const hash = new Bun.CryptoHasher("sha256");
   hash.update(resolve(input.gitCommonDir));
   hash.update("\0");
   hash.update(resolve(input.cwd));
-  return join(
-    input.home ?? bridgeHome(),
-    "reservations",
-    `${hash.digest("hex")}.json`,
-  );
+  return join(input.home ?? bridgeHome(), "reservations", hash.digest("hex"));
 }
 
-function parseReservation(value: unknown): Reservation | undefined {
+function parseContender(value: unknown): Contender | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return;
   const record = value as Record<string, unknown>;
   if (
@@ -75,43 +81,26 @@ function parseReservation(value: unknown): Reservation | undefined {
   };
 }
 
-type Current =
-  | { kind: "free" }
-  | { kind: "held"; record: Reservation }
-  | { kind: "unreadable" };
-
-async function read(path: string): Promise<Current> {
+async function readCandidates(directory: string): Promise<Candidate[]> {
+  const candidates: Candidate[] = [];
+  const glob = new Bun.Glob("*.json");
   try {
-    const record = parseReservation(JSON.parse(await safeRead(path)));
-    return record ? { kind: "held", record } : { kind: "unreadable" };
-  } catch (error) {
-    if (absent(error)) return { kind: "free" };
-    return { kind: "unreadable" };
-  }
-}
-
-async function claim(path: string, record: Reservation): Promise<boolean> {
-  try {
-    const handle = await open(
-      path,
-      constants.O_CREAT |
-        constants.O_EXCL |
-        constants.O_WRONLY |
-        constants.O_NOFOLLOW,
-      0o600,
-    );
-    try {
-      await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
+    for await (const name of glob.scan({ cwd: directory, onlyFiles: true })) {
+      const path = join(directory, name);
+      try {
+        const record = parseContender(JSON.parse(await safeRead(path)));
+        candidates.push({ path, ...(record ? { record } : {}) });
+      } catch (error) {
+        // A file that vanished between the scan and the read is simply gone; a
+        // file that will not parse cannot be a live holder, because a holder's
+        // own file is linked into place whole.
+        if (!absent(error)) candidates.push({ path });
+      }
     }
-    return true;
   } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "EEXIST")
-      return false;
-    throw error;
+    if (!absent(error)) throw error;
   }
+  return candidates;
 }
 
 function running(pid: number): boolean {
@@ -125,13 +114,13 @@ function running(pid: number): boolean {
 }
 
 /**
- * A reservation outlives its holder only until one of two things is true: the
- * process that wrote it is gone, which is only evidence on the machine that
- * wrote it, or it is older than the time any publication can take. Both bounds
- * exist so a crashed start cannot leave a worktree reserved forever.
+ * A contender counts only until one of two things is true: the process that
+ * wrote it is gone, which is only evidence on the machine that wrote it, or it
+ * is older than the time any publication can take. Both bounds exist so a
+ * crashed start cannot leave a worktree reserved forever.
  */
 function expired(
-  record: Reservation,
+  record: Contender,
   now: number,
   host: string,
   alive: (pid: number) => boolean,
@@ -141,11 +130,22 @@ function expired(
   return record.host === host && !alive(record.pid);
 }
 
-function refuse(cwd: string, current: Current): never {
-  const holder =
-    current.kind === "held"
-      ? `pid ${current.record.pid} on ${current.record.host} has held it since ${current.record.acquiredAt}`
-      : "another process holds it";
+/**
+ * Every contender orders the same files the same way, so they all elect the same
+ * holder without any of them writing to another's file. The comparison is on
+ * code units rather than through a collator: an election has to come out
+ * identically in every process, whatever locale it was started in.
+ */
+function earlierThan(left: Contender, right: Contender): number {
+  if (left.acquiredAt !== right.acquiredAt)
+    return left.acquiredAt < right.acquiredAt ? -1 : 1;
+  return left.token < right.token ? -1 : 1;
+}
+
+function refuse(cwd: string, winner: Contender | undefined): never {
+  const holder = winner
+    ? `pid ${winner.pid} on ${winner.host} has held it since ${winner.acquiredAt}`
+    : "another process holds it";
   throw new BridgeError(
     "worktree_owner_active",
     `another bridge start or continue is already publishing a worker for ${cwd} (${holder}). Let it finish and read \`claude-codex-bridge peers\`, or use a different worktree`,
@@ -155,17 +155,22 @@ function refuse(cwd: string, current: Current): never {
 /**
  * Claims the exclusive right to publish a worker into one working tree, so that
  * reconciling who owns the tree and recording the worker that takes it cannot be
- * interleaved by a second start. Refuses immediately rather than waiting: the
+ * interleaved by a second start.
+ *
+ * Each contender creates only its own file and then elects a winner from what it
+ * finds, which is what keeps a takeover safe: two commands reclaiming the same
+ * abandoned tree agree on one winner instead of each deleting what it read and
+ * claiming afterwards. Refuses immediately rather than waiting, because the
  * caller is a command someone is watching, not a queue.
  */
 export async function reserveWorktree(
   input: ReserveOptions,
 ): Promise<WorktreeReservation> {
-  const path = reservationPath(input);
+  const directory = reservationDirectory(input);
   const host = input.host ?? hostname();
   const alive = input.alive ?? running;
   const now = input.now ?? (() => Date.now());
-  const record: Reservation = {
+  const mine: Contender = {
     schemaVersion: 1,
     token: crypto.randomUUID(),
     cwd: resolve(input.cwd),
@@ -174,27 +179,31 @@ export async function reserveWorktree(
     host,
     acquiredAt: new Date(now()).toISOString(),
   };
-  await ensurePrivateDirectory(dirname(path));
-  if (!(await claim(path, record))) {
-    const current = await read(path);
-    if (
-      current.kind === "held" &&
-      !expired(current.record, now(), host, alive)
-    ) {
-      refuse(input.cwd, current);
-    }
+  const path = join(directory, `${mine.token}.json`);
+  await ensurePrivateDirectory(directory);
+  await atomicCreate(path, mine);
+  const candidates = await readCandidates(directory);
+  const standing = candidates.filter(
+    (candidate) =>
+      candidate.record !== undefined &&
+      (candidate.record.token === mine.token ||
+        !expired(candidate.record, now(), host, alive)),
+  );
+  const winner = standing
+    .map((candidate) => candidate.record as Contender)
+    .sort(earlierThan)[0];
+  if (winner?.token !== mine.token) {
     await rm(path, { force: true });
-    // One retry only: losing this one means a live contender took the tree
-    // between the break and the claim, which is a refusal rather than a race to
-    // keep running.
-    if (!(await claim(path, record))) refuse(input.cwd, await read(path));
+    refuse(input.cwd, winner);
+  }
+  // Only the elected holder tidies, and only what it proved abandoned, so no
+  // contender ever removes a file another one is still standing on.
+  for (const candidate of candidates) {
+    if (standing.includes(candidate)) continue;
+    await rm(candidate.path, { force: true });
   }
   return {
     async release() {
-      const current = await read(path);
-      // A reservation broken as stale and retaken belongs to someone else now.
-      if (current.kind === "held" && current.record.token !== record.token)
-        return;
       await rm(path, { force: true });
     },
   };
