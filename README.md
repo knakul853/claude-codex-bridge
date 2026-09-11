@@ -127,6 +127,16 @@ unsettled and could be revived into one, rather than putting a second writer on 
 same files. The refusal prints `{"code":"worktree_owner_active", ...}` on stderr
 and exits 5, naming the peer to close first.
 
+Looking up that owner and recording the worker that takes the tree are separate
+steps, so both verbs first claim the tree in `<bridge home>/reservations`, keyed by
+the repository and the worktree path rather than any name, and hold it until the
+manifest and the pairing are written. A second command arriving in that window is
+refused with the same code instead of queueing behind it, and the claim is dropped
+whether the launch succeeds or fails. A claim left behind by a crash is taken over
+once the process that wrote it is gone from the machine that wrote it, or after ten
+minutes, whichever comes first: a pid proves nothing on another host, so the clock
+is what keeps a crash from reserving a tree for good.
+
 ### Closing things down
 
 Each Claude session holds a few hundred megabytes plus its own MCP children, and a

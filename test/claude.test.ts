@@ -3,7 +3,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { continueJob, forgetJob, startJob } from "../src/claude";
 import { BridgeError } from "../src/errors";
-import { linkPeer } from "../src/peers";
+import { linkPeer, listPeers } from "../src/peers";
 import { NativeCommandError, type ProcessRunner } from "../src/process";
 import { loadManifest, writeManifest } from "../src/state";
 
@@ -525,4 +525,122 @@ test("records a worker whose launch line arrived with colour codes", async () =>
     home: repo.home,
   });
   expect(manifest.sessionId).toBe(sessionId);
+});
+
+/** A launch that yields the way a real one does, so both callers interleave. */
+function racingRunner(
+  repo: { root: string; commonDir: string },
+  launched: string[],
+  ids: string[],
+  extraAgents: Array<Record<string, unknown>> = [],
+): ProcessRunner {
+  return {
+    async run(argv) {
+      if (argv[1] === "--bg" || argv[1] === "--resume") {
+        const id = ids[launched.length] ?? "ffffffff";
+        launched.push(id);
+        await Bun.sleep(5);
+        return { stdout: `backgrounded · ${id}\n`, stderr: "", exitCode: 0 };
+      }
+      if (argv[1] === "agents") {
+        await Bun.sleep(1);
+        return {
+          stdout: JSON.stringify([
+            ...extraAgents,
+            ...launched.map((id) => ({
+              id,
+              sessionId: `${id}-1111-4111-8111-111111111111`,
+              cwd: repo.root,
+              kind: "background",
+              state: "working",
+            })),
+          ]),
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      return { stdout: `${repo.commonDir}\n`, stderr: "", exitCode: 0 };
+    },
+  };
+}
+
+function refusals(results: PromiseSettledResult<unknown>[]): string[] {
+  return results.flatMap((result) =>
+    result.status === "rejected" && result.reason instanceof BridgeError
+      ? [result.reason.code]
+      : [],
+  );
+}
+
+// Checking the tree and recording the worker that takes it are separate steps,
+// so without a reservation both callers see it free and both launch.
+test("lets exactly one concurrent start --here take the worktree", async () => {
+  const repo = await repository("bridge-race-start");
+  const launched: string[] = [];
+  const runner = racingRunner(repo, launched, ["aaaaaaaa", "bbbbbbbb"]);
+  const request = (thread: string) =>
+    startJob({
+      ownerThreadId: thread,
+      prompt: "work",
+      repository: {
+        root: repo.root,
+        commonDir: repo.commonDir,
+        branch: "main",
+        head: "c".repeat(40),
+        clean: false,
+        changedFiles: ["src/a.ts"],
+      },
+      here: true,
+      process: runner,
+      hooksReady: async () => true,
+      home: repo.home,
+    });
+
+  const results = await Promise.allSettled([
+    request("owner-one"),
+    request("owner-two"),
+  ]);
+  expect(launched).toHaveLength(1);
+  expect(await listPeers(repo.home)).toHaveLength(1);
+  expect(refusals(results)).toEqual(["worktree_owner_active"]);
+});
+
+// Two continuations of the same settled session resume the same transcript into
+// the same tree, and go through the same reservation to stop it.
+test("lets exactly one concurrent continuation resume into the worktree", async () => {
+  const repo = await repository("bridge-race-continue");
+  await writeManifest({
+    schemaVersion: 1,
+    sessionId,
+    ownerThreadId: "owner-thread",
+    gitCommonDir: repo.commonDir,
+    createdAt: "2026-09-11T00:00:00.000Z",
+  });
+  const launched: string[] = [];
+  const runner = racingRunner(
+    repo,
+    launched,
+    ["aaaaaaaa", "bbbbbbbb"],
+    [
+      {
+        id: "44444444",
+        sessionId,
+        cwd: repo.root,
+        kind: "background",
+        state: "done",
+      },
+    ],
+  );
+  const request = () =>
+    continueJob({
+      sessionId,
+      prompt: "keep going",
+      gitCommonDir: repo.commonDir,
+      process: runner,
+      home: repo.home,
+    });
+
+  const results = await Promise.allSettled([request(), request()]);
+  expect(launched).toHaveLength(1);
+  expect(refusals(results)).toEqual(["worktree_owner_active"]);
 });

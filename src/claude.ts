@@ -10,6 +10,7 @@ import { BridgeError } from "./errors";
 import { linkPeer, listPeers } from "./peers";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
 import { type RepositoryState, readRepositoryState } from "./repository";
+import { reserveWorktree } from "./reservation";
 import { redactText, truncateText } from "./safety";
 import {
   bridgeHooksInstalled,
@@ -214,9 +215,28 @@ export async function startJob(input: StartOptions): Promise<BridgeManifest> {
       "Claude completion hooks are not installed; run `claude-codex-bridge install-hooks`",
     );
   }
+  // A fresh worktree has a name nothing else can be holding; --here shares a
+  // tree, and only a reservation stops two starts from both finding it free and
+  // both publishing into it.
+  const reservation = input.here
+    ? await reserveWorktree({
+        cwd: input.repository.root,
+        gitCommonDir: input.repository.commonDir,
+        ...(input.home ? { home: input.home } : {}),
+      })
+    : undefined;
+  try {
+    return await publishWorker(input, process);
+  } finally {
+    await reservation?.release();
+  }
+}
+
+async function publishWorker(
+  input: StartOptions,
+  process: ProcessRunner,
+): Promise<BridgeManifest> {
   const agents = await inventory(process);
-  // A fresh worktree has no owner by construction; --here shares a tree that may
-  // already have one.
   if (input.here)
     await requireFreeWorktree(
       input.repository.root,
@@ -311,10 +331,34 @@ export async function continueJob(input: {
     );
   }
   await requireRepositoryBinding(process, agent.cwd, manifest.gitCommonDir);
-  // The resumed worker lands in this tree, so anything still writing there —
-  // including this session under a state label written before it went back to
-  // work — has to be settled first.
-  await requireFreeWorktree(agent.cwd, agents, process, input.home);
+  const reservation = await reserveWorktree({
+    cwd: agent.cwd,
+    gitCommonDir: manifest.gitCommonDir,
+    ...(input.home ? { home: input.home } : {}),
+  });
+  try {
+    return await resumeWorker(input, process, manifest, agent);
+  } finally {
+    await reservation.release();
+  }
+}
+
+async function resumeWorker(
+  input: { prompt: string; home?: string; now?: () => string },
+  process: ProcessRunner,
+  manifest: BridgeManifest,
+  agent: AgentRecord,
+): Promise<BridgeManifest> {
+  const id = manifest.sessionId;
+  // Re-read under the reservation: anything still writing in this tree — a
+  // contender that published while we queued, or this session under a state
+  // label written before it went back to work — has to be settled first.
+  await requireFreeWorktree(
+    agent.cwd,
+    await inventory(process),
+    process,
+    input.home,
+  );
   const launch = await process.run(
     ["claude", "--resume", id, "--bg", withHandoverContract(input.prompt)],
     {
