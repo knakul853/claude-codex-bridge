@@ -114,10 +114,8 @@ test("releasing a superseded hold leaves the new holder alone", async () => {
   expect(error.code).toBe("worktree_owner_active");
 });
 
-// Contenders used to decide from their own snapshot of the directory, so one
-// could scan before another existed and both declare themselves the holder.
-// Ownership is now a single exclusive create, which only separate processes can
-// contend for the way a second bridge command does.
+// Separate processes are the only thing that contends for an exclusive create
+// the way a second bridge command does.
 test("lets one of several processes supersede an abandoned holder", async () => {
   const root = await home();
   // A holder whose process is provably gone, which is the only kind that may be
