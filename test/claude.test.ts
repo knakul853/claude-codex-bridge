@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { startJob } from "../src/claude";
+import { continueJob, startJob } from "../src/claude";
 import type { ProcessRunner } from "../src/process";
+import { writeManifest } from "../src/state";
 
 const roots: string[] = [];
 const sessionId = "44444444-4444-4444-8444-444444444444";
@@ -178,4 +179,71 @@ test("shares the current tree with --here instead of cutting a worktree", async 
   expect(launch).not.toContain("--worktree");
   expect(launch).toContain("--permission-mode");
   expect(launch).toContain("acceptEdits");
+});
+
+test("tracks the new session id returned by a background continuation", async () => {
+  const root = (
+    await Bun.$`mktemp -d /tmp/bridge-continue.XXXXXX`.text()
+  ).trim();
+  const commonDir = join(root, ".git");
+  roots.push(root);
+  await mkdir(commonDir);
+  await writeManifest({
+    schemaVersion: 1,
+    sessionId,
+    ownerThreadId: "owner-thread",
+    gitCommonDir: commonDir,
+    createdAt: "2026-09-09T00:00:00.000Z",
+    name: "Planner visibility",
+  });
+  const continuedId = "55555555-5555-4555-8555-555555555555";
+  let inventories = 0;
+  const runner: ProcessRunner = {
+    async run(argv) {
+      if (argv[0] === "claude" && argv[1] === "agents") {
+        inventories += 1;
+        return {
+          stdout: JSON.stringify(
+            inventories === 1
+              ? [{ id: "44444444", sessionId, cwd: root, state: "done" }]
+              : [
+                  { id: "44444444", sessionId, cwd: root, state: "done" },
+                  {
+                    id: "55555555",
+                    sessionId: continuedId,
+                    cwd: root,
+                    state: "working",
+                  },
+                ],
+          ),
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      if (argv[0] === "claude" && argv[1] === "--resume") {
+        return { stdout: "backgrounded · 55555555\n", stderr: "", exitCode: 0 };
+      }
+      if (argv[0] === "git") {
+        return { stdout: `${commonDir}\n`, stderr: "", exitCode: 0 };
+      }
+      throw new Error(`unexpected command: ${argv.join(" ")}`);
+    },
+  };
+
+  const continuation = await continueJob({
+    sessionId,
+    prompt: "Fix planner visibility",
+    gitCommonDir: commonDir,
+    process: runner,
+    home: join(root, "bridge-home"),
+    now: () => "2026-09-10T00:00:00.000Z",
+  });
+
+  expect(continuation.sessionId).toBe(continuedId);
+  expect(
+    await readFile(
+      join(commonDir, "claude-codex-bridge", "jobs", `${continuedId}.json`),
+      "utf8",
+    ),
+  ).not.toContain("Fix planner visibility");
 });

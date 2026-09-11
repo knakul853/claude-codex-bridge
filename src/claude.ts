@@ -84,6 +84,22 @@ async function inventory(process: ProcessRunner): Promise<AgentRecord[]> {
   );
 }
 
+async function launchedAgent(
+  process: ProcessRunner,
+  stdout: string,
+): Promise<AgentRecord> {
+  const shortId = stdout.match(/backgrounded\s+·\s+([0-9a-f]{8})\b/i)?.[1];
+  if (!shortId)
+    throw new Error("Claude did not report the background session id");
+  const matches = (await inventory(process)).filter(
+    (agent) => agent.id === shortId,
+  );
+  if (matches.length !== 1 || !matches[0]) {
+    throw new Error("Claude background session could not be resolved uniquely");
+  }
+  return matches[0];
+}
+
 async function requireRepositoryBinding(
   process: ProcessRunner,
   cwd: string,
@@ -180,25 +196,15 @@ export async function startJob(input: StartOptions): Promise<BridgeManifest> {
     ],
     { cwd: input.repository.root },
   );
-  const shortId = launch.stdout.match(
-    /backgrounded\s+·\s+([0-9a-f]{8})\b/i,
-  )?.[1];
-  if (!shortId)
-    throw new Error("Claude did not report the background session id");
-  const matches = (await inventory(process)).filter(
-    (agent) => agent.id === shortId,
-  );
-  if (matches.length !== 1 || !matches[0]) {
-    throw new Error("Claude background session could not be resolved uniquely");
-  }
+  const agent = await launchedAgent(process, launch.stdout);
   await requireRepositoryBinding(
     process,
-    matches[0].cwd,
+    agent.cwd,
     input.repository.commonDir,
   );
   const manifest = parseManifest({
     schemaVersion: 1,
-    sessionId: parseSessionId(matches[0].sessionId),
+    sessionId: parseSessionId(agent.sessionId),
     ownerThreadId: input.ownerThreadId,
     ...(input.name ? { name: input.name } : {}),
     gitCommonDir: input.repository.commonDir,
@@ -207,7 +213,7 @@ export async function startJob(input: StartOptions): Promise<BridgeManifest> {
   await writeManifest(manifest);
   await linkPeer(
     {
-      cwd: matches[0].cwd,
+      cwd: agent.cwd,
       claudeSessionId: manifest.sessionId,
       codexThreadId: manifest.ownerThreadId,
       ...(input.name ? { label: input.name } : {}),
@@ -237,7 +243,9 @@ export async function continueJob(input: {
   prompt: string;
   gitCommonDir: string;
   process?: ProcessRunner;
-}): Promise<void> {
+  home?: string;
+  now?: () => string;
+}): Promise<BridgeManifest> {
   const process = input.process ?? nativeProcessRunner;
   const id = parseSessionId(input.sessionId);
   const manifest = await loadManifest(input.gitCommonDir, id);
@@ -257,12 +265,31 @@ export async function continueJob(input: {
     );
   }
   await requireRepositoryBinding(process, agent.cwd, manifest.gitCommonDir);
-  await process.run(
+  const launch = await process.run(
     ["claude", "--resume", id, "--bg", withHandoverContract(input.prompt)],
     {
       cwd: agent.cwd,
     },
   );
+  const resumed = await launchedAgent(process, launch.stdout);
+  await requireRepositoryBinding(process, resumed.cwd, manifest.gitCommonDir);
+  if (resumed.sessionId === manifest.sessionId) return manifest;
+  const continuation = parseManifest({
+    ...manifest,
+    sessionId: parseSessionId(resumed.sessionId),
+    createdAt: (input.now ?? (() => new Date().toISOString()))(),
+  });
+  await writeManifest(continuation);
+  await linkPeer(
+    {
+      cwd: resumed.cwd,
+      claudeSessionId: continuation.sessionId,
+      codexThreadId: continuation.ownerThreadId,
+      ...(continuation.name ? { label: continuation.name } : {}),
+    },
+    input.home,
+  );
+  return continuation;
 }
 
 function reviewMessage(input: {

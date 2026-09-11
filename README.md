@@ -87,6 +87,9 @@ printf '%s' 'Address the owner feedback and re-verify.' |
   claude-codex-bridge continue --session <claude-session-uuid>
 ```
 
+Claude may implement a background resume as a new native session. The command
+prints that active session ID and carries the same Codex owner routing forward.
+
 Claude can request Codex review for its current session. Choose an existing
 Codex task, or create a new durable task in Codex Desktop:
 

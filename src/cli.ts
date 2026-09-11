@@ -420,12 +420,12 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "continue") {
-    await continueJob({
+    const continuation = await continueJob({
       sessionId,
       prompt: await prompt(),
       gitCommonDir: repo.commonDir,
     });
-    emit({ ok: true, sessionId });
+    emit({ ok: true, sessionId: continuation.sessionId });
     return;
   }
   if (command === "status") {
