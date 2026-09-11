@@ -313,6 +313,13 @@ Allowed dispositions are `ready_for_review`, `needs_owner`, `blocked`, and
 `failed`. The summary is treated as untrusted data and limited to 4,000 UTF-8
 bytes. The Codex notification separately includes Git state read by the bridge.
 
+That pair is also what identifies a delivery: the session, the parsed
+disposition and summary, and the branch, head, cleanliness and changed files the
+bridge read itself. The prose around the block is not part of it, because other
+Stop hooks rewrite that prose and a reworded ending is not a second handover. A
+handover whose disposition, summary or commit has moved on is a new delivery and
+still reaches the owner.
+
 ## Development
 
 ```sh

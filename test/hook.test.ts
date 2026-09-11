@@ -17,7 +17,7 @@ function dependencies(overrides: Partial<HookDependencies> = {}): {
   queued: string[];
 } {
   const queued: string[] = [];
-  let claimed = false;
+  const claimed = new Set<string>();
   return {
     queued,
     deps: {
@@ -30,9 +30,9 @@ function dependencies(overrides: Partial<HookDependencies> = {}): {
         changedFiles: ["src/fix.ts"],
       }),
       loadManifest: async () => manifest,
-      claimDelivery: async () => {
-        if (claimed) return false;
-        claimed = true;
+      claimDelivery: async (_common, eventId) => {
+        if (claimed.has(eventId)) return false;
+        claimed.add(eventId);
         return true;
       },
       settleDelivery: async () => undefined,
@@ -124,4 +124,50 @@ test("marks delivery unknown and does not retry when queueing fails", async () =
     "unknown",
   );
   expect(settlements).toEqual(["unknown"]);
+});
+
+const handover =
+  '<agent_handover>{"disposition":"ready_for_review","summary":"Fixed the lifecycle bug."}</agent_handover>';
+
+function stop(message: string) {
+  return {
+    session_id: sessionId,
+    cwd: "/repo/worktree",
+    hook_event_name: "Stop",
+    last_assistant_message: message,
+  };
+}
+
+// A Stop hook rewrites the prose around an unchanged handover and the session
+// stops again, which used to read as a second event because the whole message
+// was hashed.
+test("queues once when only the prose around the handover is rewritten", async () => {
+  const { deps, queued } = dependencies();
+  await handleHook(stop(`Committed as 736ed40.\n\n${handover}`), deps);
+  await handleHook(stop(`Fixed and committed locally.\n\n${handover}`), deps);
+  expect(queued).toHaveLength(1);
+});
+
+test("queues again when the handover or the Git head changes", async () => {
+  let head = "a".repeat(40);
+  const { deps, queued } = dependencies({
+    gitState: async () => ({
+      commonDir: "/repo/.git",
+      root: "/repo/example",
+      branch: "codex/fix",
+      head,
+      clean: false,
+      changedFiles: ["src/fix.ts"],
+    }),
+  });
+  await handleHook(stop(`Done.\n\n${handover}`), deps);
+  await handleHook(
+    stop(
+      'Done.\n\n<agent_handover>{"disposition":"blocked","summary":"Needs the owner."}</agent_handover>',
+    ),
+    deps,
+  );
+  head = "b".repeat(40);
+  await handleHook(stop(`Done.\n\n${handover}`), deps);
+  expect(queued).toHaveLength(3);
 });

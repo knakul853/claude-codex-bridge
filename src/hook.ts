@@ -117,15 +117,39 @@ function samePath(left: string, right: string): boolean {
   return resolve(left) === resolve(right);
 }
 
-function eventId(input: HookInput): string {
+type Outcome = "handover" | "protocol_failure" | "runtime_failure";
+
+/**
+ * What the owner is actually being told, reduced to a stable identity. Hooks
+ * rewrite the prose around a handover between one Stop and the next, so hashing
+ * the assistant message made a rewording look like a second event; the parsed
+ * handover and the independently read Git state are what change when there is
+ * genuinely something new to deliver. Every part is hashed, never emitted.
+ */
+function deliveryIdentity(input: {
+  sessionId: string;
+  outcome: Outcome;
+  git: RepositoryState;
+  handover?: AgentHandover;
+  runtimeFailure?: string;
+}): string {
   const hash = new Bun.CryptoHasher("sha256");
-  hash.update(input.session_id);
-  hash.update("\0");
-  hash.update(input.hook_event_name);
-  hash.update("\0");
-  hash.update(input.last_assistant_message ?? "");
-  hash.update("\0");
-  hash.update(input.error ?? "");
+  const parts = [
+    input.sessionId,
+    input.outcome,
+    input.git.head,
+    input.git.branch,
+    input.git.clean ? "clean" : "dirty",
+    JSON.stringify([...input.git.changedFiles].sort()),
+    input.handover
+      ? JSON.stringify([input.handover.disposition, input.handover.summary])
+      : "",
+    input.runtimeFailure ?? "",
+  ];
+  for (const part of parts) {
+    hash.update(part);
+    hash.update("\0");
+  }
   return hash.digest("hex");
 }
 
@@ -165,10 +189,10 @@ async function deliver(
   input: HookInput,
   manifest: BridgeManifest,
   git: RepositoryState,
+  id: string,
   message: string,
   deps: HookDependencies,
 ): Promise<HookResult> {
-  const id = eventId(input);
   if (!(await deps.claimDelivery(git.commonDir, id, input.session_id)))
     return { kind: "allow" };
   try {
@@ -198,18 +222,21 @@ export async function handleHook(
   ) {
     throw new Error("hook identity does not match the recorded manifest");
   }
-  const id = eventId(input);
+  const sessionId = input.session_id;
   if (input.hook_event_name === "StopFailure") {
+    const runtimeFailure = input.error ?? "Runtime failure without detail.";
+    const id = deliveryIdentity({
+      sessionId,
+      outcome: "runtime_failure",
+      git,
+      runtimeFailure,
+    });
     return deliver(
       input,
       manifest,
       git,
-      notification({
-        manifest,
-        runtimeFailure: input.error ?? "Runtime failure without detail.",
-        eventId: id,
-        git,
-      }),
+      id,
+      notification({ manifest, runtimeFailure, eventId: id, git }),
       deps,
     );
   }
@@ -223,18 +250,34 @@ export async function handleHook(
         reason: "Emit the required final <agent_handover> JSON block.",
       };
     }
+    // Nothing parsed, so there is no payload to identify this by. The message
+    // the owner gets says only that no handover arrived, which makes two such
+    // stops at one revision the same notification.
+    const id = deliveryIdentity({
+      sessionId,
+      outcome: "protocol_failure",
+      git,
+    });
     return deliver(
       input,
       manifest,
       git,
+      id,
       notification({ manifest, eventId: id, git }),
       deps,
     );
   }
+  const id = deliveryIdentity({
+    sessionId,
+    outcome: "handover",
+    git,
+    handover,
+  });
   return deliver(
     input,
     manifest,
     git,
+    id,
     notification({ manifest, handover, eventId: id, git }),
     deps,
   );
