@@ -129,17 +129,42 @@ export class MissingHandoverError extends Error {
   }
 }
 
+const HANDOVER_OPEN = "<agent_handover>";
+const HANDOVER_CLOSE = "</agent_handover>";
+
+/**
+ * Reads the handover off the end of the final response.
+ *
+ * The block closes the message by contract, so it is located from the end
+ * rather than by scanning forward. A forward scan pairs the first opening tag
+ * it sees with the real block's closing tag, and prose legitimately contains
+ * that tag — most of all when the subject is this contract, which is exactly
+ * when an agent quotes it. Everything in between then reaches JSON.parse and
+ * fails on whatever punctuation the sentence happened to use.
+ *
+ * Two complete blocks are still refused. The opening tag alone may be
+ * discussed; a closing tag before this block cannot be anything but a second
+ * handover.
+ */
 export function parseHandover(message: string): AgentHandover {
-  const matches = [
-    ...message.matchAll(/<agent_handover>\s*([\s\S]*?)\s*<\/agent_handover>/g),
-  ];
-  if (matches.length === 0) {
+  const end = message.trimEnd();
+  if (!end.endsWith(HANDOVER_CLOSE)) {
+    if (end.includes(HANDOVER_CLOSE)) {
+      throw new Error("the agent_handover block must end the final response");
+    }
     throw new MissingHandoverError();
   }
-  if (matches.length > 1) {
+  const closeAt = end.length - HANDOVER_CLOSE.length;
+  const openAt = end.lastIndexOf(HANDOVER_OPEN, closeAt);
+  if (openAt < 0) {
+    throw new MissingHandoverError();
+  }
+  if (end.slice(0, openAt).includes(HANDOVER_CLOSE)) {
     throw new Error("final response must carry exactly one agent_handover");
   }
-  const payload = JSON.parse(matches[0]?.[1] ?? "") as unknown;
+  const payload = JSON.parse(
+    end.slice(openAt + HANDOVER_OPEN.length, closeAt).trim(),
+  ) as unknown;
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("agent handover must be an object");
   }
