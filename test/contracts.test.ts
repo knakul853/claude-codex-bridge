@@ -16,6 +16,30 @@ describe("handover contract", () => {
     ).toEqual({ disposition: "ready_for_review", summary: "Done." });
   });
 
+  test("reads the block off the end even when prose quotes the tag", () => {
+    const open = `<${"agent_handover"}>`;
+    const message = [
+      `Every failure reported "Emit the required final ${open} JSON block."`,
+      "",
+      `${open}{"disposition":"ready_for_review","summary":"Done."}</agent_handover>`,
+    ].join("\n");
+
+    // A forward scan pairs the quoted tag with the real block's closing tag and
+    // hands the sentence in between to JSON.parse.
+    expect(parseHandover(message)).toEqual({
+      disposition: "ready_for_review",
+      summary: "Done.",
+    });
+  });
+
+  test("refuses a block that does not end the response", () => {
+    expect(() =>
+      parseHandover(
+        '<agent_handover>{"disposition":"failed","summary":"a"}</agent_handover>\n\nand one more thing',
+      ),
+    ).toThrow(/must end the final response/);
+  });
+
   test("accepts a summary laid out in paragraphs", () => {
     const summary = "Shipped the planner.\n\nOwner must still run the live PR.";
 
