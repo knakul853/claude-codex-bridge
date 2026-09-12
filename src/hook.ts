@@ -2,6 +2,8 @@ import { basename, resolve } from "node:path";
 import {
   type AgentHandover,
   type BridgeManifest,
+  hasUnsafeControl,
+  MissingHandoverError,
   parseHandover,
   parseSessionId,
 } from "./contracts";
@@ -47,6 +49,26 @@ export type HookResult =
   | { kind: "allow"; warning?: string }
   | { kind: "block"; reason: string };
 
+/** Keeps a parser message from becoming the whole correction. */
+const BLOCK_REASON_DETAIL_LIMIT = 200;
+
+/**
+ * Why the stop was blocked, in the parser's own words.
+ *
+ * A handover that was present but refused — over its bound, or carrying an
+ * escape sequence — needs a different correction from one that was never
+ * written. Reporting both as "emit the block" sends the agent back to re-send
+ * exactly what was just rejected, which is a loop it cannot see the way out of.
+ * The detail goes to the agent that wrote the message, never outbound.
+ */
+function handoverBlockReason(error: unknown): string {
+  if (error instanceof MissingHandoverError || !(error instanceof Error)) {
+    return "Emit the required final <agent_handover> JSON block.";
+  }
+  const detail = error.message.slice(0, BLOCK_REASON_DETAIL_LIMIT);
+  return `The final <agent_handover> block was rejected: ${detail}. Emit exactly one corrected block.`;
+}
+
 function bounded(
   value: unknown,
   name: string,
@@ -61,24 +83,6 @@ function bounded(
     throw new Error(`${name} contains a terminal control character`);
   }
   return value;
-}
-
-function hasUnsafeControl(
-  value: string,
-  allowTextWhitespace: boolean,
-): boolean {
-  for (const character of value) {
-    const code = character.codePointAt(0) ?? 0;
-    const control = code <= 0x1f || (code >= 0x7f && code <= 0x9f);
-    if (!control) continue;
-    if (
-      allowTextWhitespace &&
-      (code === 0x09 || code === 0x0a || code === 0x0d)
-    )
-      continue;
-    return true;
-  }
-  return false;
 }
 
 export function parseHookInput(value: unknown): HookInput {
@@ -243,12 +247,9 @@ export async function handleHook(
   let handover: AgentHandover;
   try {
     handover = parseHandover(input.last_assistant_message ?? "");
-  } catch {
+  } catch (error) {
     if (!input.stop_hook_active) {
-      return {
-        kind: "block",
-        reason: "Emit the required final <agent_handover> JSON block.",
-      };
+      return { kind: "block", reason: handoverBlockReason(error) };
     }
     // Nothing parsed, so there is no payload to identify this by. The message
     // the owner gets says only that no handover arrived, which makes two such

@@ -64,6 +64,7 @@ function boundedString(
   value: unknown,
   name: string,
   max = IDENTIFIER_LIMIT_BYTES,
+  allowTextWhitespace = false,
 ): string {
   if (
     typeof value !== "string" ||
@@ -74,10 +75,37 @@ function boundedString(
       `${name} must be a non-empty string of at most ${max} bytes`,
     );
   }
-  if (/\p{Cc}/u.test(value)) {
+  if (hasUnsafeControl(value, allowTextWhitespace)) {
     throw new Error(`${name} contains a control character`);
   }
   return value;
+}
+
+/**
+ * The one rule about control characters this package has. Terminal escape
+ * sequences are the hazard; tab, line feed and carriage return are not, and a
+ * prose field that refuses them refuses paragraphs. Identifiers stay strict — a
+ * session id or a path spanning two lines is malformed, not formatted.
+ *
+ * It lives here, and the hook reads it from here, because the two used to be
+ * separate rules that disagreed: the hook admitted a multi-line assistant
+ * message and the handover parser then refused the summary inside it.
+ */
+export function hasUnsafeControl(
+  value: string,
+  allowTextWhitespace: boolean,
+): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code > 0x1f && (code < 0x7f || code > 0x9f)) continue;
+    if (
+      allowTextWhitespace &&
+      (code === 0x09 || code === 0x0a || code === 0x0d)
+    )
+      continue;
+    return true;
+  }
+  return false;
 }
 
 export function parseSessionId(value: unknown): string {
@@ -88,12 +116,28 @@ export function parseSessionId(value: unknown): string {
   return sessionId;
 }
 
+/**
+ * No handover block was written at all. It is separate from every other parse
+ * failure because the correction is: one asks for the block, the rest ask for a
+ * different block, and telling an agent to emit what it already emitted is a
+ * loop it cannot see the way out of.
+ */
+export class MissingHandoverError extends Error {
+  constructor() {
+    super("final response must contain exactly one agent_handover");
+    this.name = "MissingHandoverError";
+  }
+}
+
 export function parseHandover(message: string): AgentHandover {
   const matches = [
     ...message.matchAll(/<agent_handover>\s*([\s\S]*?)\s*<\/agent_handover>/g),
   ];
-  if (matches.length !== 1) {
-    throw new Error("final response must contain exactly one agent_handover");
+  if (matches.length === 0) {
+    throw new MissingHandoverError();
+  }
+  if (matches.length > 1) {
+    throw new Error("final response must carry exactly one agent_handover");
   }
   const payload = JSON.parse(matches[0]?.[1] ?? "") as unknown;
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
@@ -110,10 +154,13 @@ export function parseHandover(message: string): AgentHandover {
   ) {
     throw new Error("agent handover disposition is invalid");
   }
+  // The summary is written for a person to read, so it may be laid out in
+  // paragraphs; everything else about it stays as strict as an identifier.
   const summary = boundedString(
     record.summary,
     "agent handover summary",
     HANDOVER_LIMIT_BYTES,
+    true,
   );
   return { disposition: record.disposition as HandoverDisposition, summary };
 }
