@@ -64,6 +64,26 @@ test("blocks one malformed stop, then reports a bounded protocol failure", async
   expect(queued[0]).not.toContain("done without a handover");
 });
 
+test("a refused handover is corrected by name, not reported as a missing one", async () => {
+  const { deps } = dependencies();
+  const summary = "x".repeat(4_001);
+  const result = await handleHook(
+    {
+      session_id: sessionId,
+      cwd: "/repo/worktree",
+      hook_event_name: "Stop",
+      last_assistant_message: `<agent_handover>${JSON.stringify({ disposition: "ready_for_review", summary })}</agent_handover>`,
+    },
+    deps,
+  );
+
+  // The block was written; saying "emit the block" would send the agent back
+  // to re-send exactly what was just refused.
+  expect(result.kind).toBe("block");
+  expect(result.kind === "block" && result.reason).toContain("was rejected");
+  expect(result.kind === "block" && result.reason).toContain("4000 bytes");
+});
+
 test("delivers one structured handover with independently read Git state", async () => {
   const { deps, queued } = dependencies();
   const input = {
