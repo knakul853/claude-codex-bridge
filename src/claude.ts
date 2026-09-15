@@ -26,6 +26,7 @@ import {
 import {
   isActive,
   reconcileSessions,
+  type SessionFacts,
   stopSession,
   worktreeOwner,
 } from "./supervision";
@@ -393,6 +394,52 @@ function exactAgent(agents: AgentRecord[], sessionId: string): AgentRecord {
   return matches[0];
 }
 
+/**
+ * Refuses a session that still has work in flight, and says which kind. A
+ * background session that ended keeps its host process, so a pid on its own is
+ * not the test; what refuses is a reconciled state saying the session is working
+ * or waiting. A worker waiting on a permission decision is the operator's to
+ * answer, never the bridge's to approve or to resume past.
+ */
+function requireNothingWriting(facts: SessionFacts, shortId?: string): void {
+  if (facts.pid === undefined) return;
+  if (facts.disposition !== "working" && facts.disposition !== "stuck") return;
+  const attach = shortId ? ` \`claude attach ${shortId}\`` : "";
+  throw new BridgeError(
+    "session_not_resumable",
+    facts.disposition === "stuck"
+      ? `session ${facts.sessionId} is waiting for a permission decision (pid ${facts.pid}). Answer it in${attach}, or stop it deliberately; the bridge never approves on your behalf`
+      : `session ${facts.sessionId} is still working (pid ${facts.pid}, native state "${facts.state ?? "unknown"}"). Wait for its handover, or stop it deliberately`,
+  );
+}
+
+async function sessionFacts(
+  sessionId: string,
+  agents: AgentRecord[],
+  process: ProcessRunner,
+): Promise<SessionFacts> {
+  const facts = (
+    await reconcileSessions({
+      sessionIds: [sessionId],
+      agents,
+      runner: process,
+    })
+  ).get(sessionId);
+  return (
+    facts ?? {
+      sessionId,
+      disposition: "gone",
+      revivable: false,
+      verified: false,
+    }
+  );
+}
+
+export interface ContinueResult {
+  manifest: BridgeManifest;
+  actions: string[];
+}
+
 export async function continueJob(input: {
   sessionId: string;
   prompt: string;
@@ -400,7 +447,7 @@ export async function continueJob(input: {
   process?: ProcessRunner;
   home?: string;
   now?: () => string;
-}): Promise<BridgeManifest> {
+}): Promise<ContinueResult> {
   const process = input.process ?? nativeProcessRunner;
   const id = parseSessionId(input.sessionId);
   const manifest = await loadManifest(input.gitCommonDir, id);
@@ -415,11 +462,8 @@ export async function continueJob(input: {
       `session ${id} is interactive; message it with \`claude-codex-bridge notify --to ${id}\` instead`,
     );
   }
-  if (!["done", "stopped"].includes(agent.state ?? "")) {
-    throw new Error(
-      "Claude session is live, blocked, failed, or in an unrecognized state",
-    );
-  }
+  // The native state is the last label the daemon wrote, not a live condition.
+  requireNothingWriting(await sessionFacts(id, agents, process), agent.id);
   await requireRepositoryBinding(process, agent.cwd, manifest.gitCommonDir);
   const reservation = await reserveWorktree({
     cwd: agent.cwd,
@@ -429,25 +473,57 @@ export async function continueJob(input: {
   return resumeWorker(input, process, manifest, agent, reservation);
 }
 
+/**
+ * Hands a finished session back to the daemon before resuming it. A worker whose
+ * process is gone can still hold an unsettled background lease, and the daemon
+ * revives such a worker on takeover; resuming across one is how a tree ends up
+ * with two writers. The lease is released through the supported stop — the step
+ * an operator otherwise performs by hand — and only once nothing is running.
+ */
+async function settleForResume(input: {
+  sessionId: string;
+  process: ProcessRunner;
+}): Promise<{ agents: AgentRecord[]; actions: string[] }> {
+  const agents = await inventory(input.process);
+  const facts = await sessionFacts(input.sessionId, agents, input.process);
+  requireNothingWriting(facts, facts.shortId);
+  if (!facts.revivable) return { agents, actions: [] };
+  const outcome = await stopSession({
+    sessionId: input.sessionId,
+    inventory: () => inventory(input.process),
+    runner: input.process,
+  });
+  if (!outcome.stopped) {
+    throw new BridgeError(
+      "termination_unconfirmed",
+      `session ${input.sessionId} is listed as "${facts.state ?? "unknown"}" with no process, and its background lease could not be settled, so it was not resumed. Actions: ${outcome.actions.join("; ")}`,
+    );
+  }
+  return {
+    agents: await inventory(input.process),
+    actions: [
+      `settled the background lease of ${input.sessionId}, which claude still listed as "${facts.state ?? "unknown"}" with no process`,
+    ],
+  };
+}
+
 async function resumeWorker(
   input: { prompt: string; home?: string; now?: () => string },
   process: ProcessRunner,
   manifest: BridgeManifest,
   agent: AgentRecord,
   reservation: WorktreeReservation,
-): Promise<BridgeManifest> {
+): Promise<ContinueResult> {
   let resumed: AgentRecord | undefined;
+  const actions: string[] = [];
   try {
     const id = manifest.sessionId;
     // Re-read under the reservation: anything still writing in this tree — a
     // contender that published while we queued, or this session under a state
     // label written before it went back to work — has to be settled first.
-    await requireFreeWorktree(
-      agent.cwd,
-      await inventory(process),
-      process,
-      input.home,
-    );
+    const settled = await settleForResume({ sessionId: id, process });
+    actions.push(...settled.actions);
+    await requireFreeWorktree(agent.cwd, settled.agents, process, input.home);
     const launch = await process.run(
       ["claude", "--resume", id, "--bg", withHandoverContract(input.prompt)],
       {
@@ -458,7 +534,7 @@ async function resumeWorker(
     await requireRepositoryBinding(process, resumed.cwd, manifest.gitCommonDir);
     if (resumed.sessionId === manifest.sessionId) {
       await reservation.release();
-      return manifest;
+      return { manifest, actions };
     }
     const continuation = parseManifest({
       ...manifest,
@@ -477,7 +553,7 @@ async function resumeWorker(
       input.home,
     );
     await reservation.release();
-    return continuation;
+    return { manifest: continuation, actions };
   } catch (error) {
     if (!resumed) {
       await reservation.release();

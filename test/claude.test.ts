@@ -249,7 +249,7 @@ test("tracks the new session id returned by a background continuation", async ()
     now: () => "2026-09-10T00:00:00.000Z",
   });
 
-  expect(continuation.sessionId).toBe(continuedId);
+  expect(continuation.manifest.sessionId).toBe(continuedId);
   expect(
     await readFile(
       join(commonDir, "claude-codex-bridge", "jobs", `${continuedId}.json`),
@@ -713,4 +713,202 @@ test("keeps a worktree owned when publication fails after Claude launched", asyn
   )) as BridgeError;
   expect(second.code).toBe("worktree_owner_active");
   expect(launched).toHaveLength(1);
+});
+
+/**
+ * A finished worker keeps whatever state label the daemon last wrote, so the
+ * inventory can still call it blocked or working with no process anywhere. The
+ * supported way back is the native stop, which releases the background lease.
+ */
+function staleRunner(input: {
+  sessionId: string;
+  shortId: string;
+  cwd: string;
+  commonDir: string;
+  state: string;
+  pid?: number;
+  stopSettles?: boolean;
+}): { process: ProcessRunner; calls: string[][] } {
+  const calls: string[][] = [];
+  let settled = false;
+  return {
+    calls,
+    process: {
+      async run(argv) {
+        calls.push(argv);
+        if (argv[0] === "claude" && argv[1] === "stop") {
+          if (input.stopSettles !== false) settled = true;
+          return { stdout: "stopped\n", stderr: "", exitCode: 0 };
+        }
+        if (argv[1] === "--resume")
+          return {
+            stdout: `backgrounded · ${input.shortId}\n`,
+            stderr: "",
+            exitCode: 0,
+          };
+        if (argv[1] === "agents")
+          return {
+            stdout: JSON.stringify([
+              {
+                id: input.shortId,
+                sessionId: input.sessionId,
+                cwd: input.cwd,
+                kind: "background",
+                state: settled ? "stopped" : input.state,
+                ...(input.pid !== undefined && !settled
+                  ? { pid: input.pid }
+                  : {}),
+              },
+            ]),
+            stderr: "",
+            exitCode: 0,
+          };
+        if (argv[0] === "ps") {
+          const wanted = new Set((argv.at(-1) ?? "").split(",").map(Number));
+          const lines =
+            input.pid !== undefined && !settled && wanted.has(input.pid)
+              ? [
+                  `${input.pid} 1 256000 /opt/claude/versions/2.1.0 --resume /p/x.jsonl`,
+                ]
+              : [];
+          if (lines.length === 0) throw new NativeCommandError("ps", 1, "");
+          return { stdout: `${lines.join("\n")}\n`, stderr: "", exitCode: 0 };
+        }
+        return { stdout: `${input.commonDir}\n`, stderr: "", exitCode: 0 };
+      },
+    },
+  };
+}
+
+async function continuable(prefix: string): Promise<{
+  root: string;
+  commonDir: string;
+  home: string;
+}> {
+  const repo = await repository(prefix);
+  await writeManifest({
+    schemaVersion: 1,
+    sessionId,
+    ownerThreadId: "owner-thread",
+    gitCommonDir: repo.commonDir,
+    createdAt: "2026-09-15T00:00:00.000Z",
+  });
+  await linkPeer(
+    {
+      cwd: repo.root,
+      claudeSessionId: sessionId,
+      gitCommonDir: repo.commonDir,
+    },
+    repo.home,
+  );
+  return { root: repo.root, commonDir: repo.commonDir, home: repo.home };
+}
+
+test("continues a session the inventory still calls blocked with no process", async () => {
+  const repo = await continuable("bridge-continue-stale");
+  const recorder = staleRunner({
+    sessionId,
+    shortId: "44444444",
+    cwd: repo.root,
+    commonDir: repo.commonDir,
+    state: "blocked",
+  });
+
+  const result = await continueJob({
+    sessionId,
+    prompt: "address the owner feedback",
+    gitCommonDir: repo.commonDir,
+    process: recorder.process,
+    home: repo.home,
+  });
+
+  expect(result.manifest.sessionId).toBe(sessionId);
+  // The lease is released through the supported stop, not by editing state.
+  expect(
+    recorder.calls.some((argv) => argv[0] === "claude" && argv[1] === "stop"),
+  ).toBe(true);
+  expect(recorder.calls.some((argv) => argv[1] === "--resume")).toBe(true);
+  expect(result.actions.join(" ")).toMatch(/settled the background lease/);
+});
+
+test("refuses a session whose live process is waiting for a permission decision", async () => {
+  const repo = await continuable("bridge-continue-permission");
+  const recorder = staleRunner({
+    sessionId,
+    shortId: "44444444",
+    cwd: repo.root,
+    commonDir: repo.commonDir,
+    state: "blocked",
+    pid: 4242,
+  });
+
+  const error = (await continueJob({
+    sessionId,
+    prompt: "address the owner feedback",
+    gitCommonDir: repo.commonDir,
+    process: recorder.process,
+    home: repo.home,
+  }).catch((reason: unknown) => reason)) as BridgeError;
+
+  expect(error).toBeInstanceOf(BridgeError);
+  expect(error.code).toBe("session_not_resumable");
+  expect(error.message).toMatch(/permission decision/);
+  // Neither stopped on its behalf nor resumed past it.
+  expect(
+    recorder.calls.some((argv) => argv[0] === "claude" && argv[1] === "stop"),
+  ).toBe(false);
+  expect(recorder.calls.some((argv) => argv[1] === "--resume")).toBe(false);
+});
+
+test("refuses to resume when the background lease will not settle", async () => {
+  const repo = await continuable("bridge-continue-unsettled");
+  const recorder = staleRunner({
+    sessionId,
+    shortId: "44444444",
+    cwd: repo.root,
+    commonDir: repo.commonDir,
+    state: "blocked",
+    stopSettles: false,
+  });
+
+  const error = (await continueJob({
+    sessionId,
+    prompt: "address the owner feedback",
+    gitCommonDir: repo.commonDir,
+    process: recorder.process,
+    home: repo.home,
+  }).catch((reason: unknown) => reason)) as BridgeError;
+
+  expect(error).toBeInstanceOf(BridgeError);
+  expect(error.code).toBe("termination_unconfirmed");
+  expect(recorder.calls.some((argv) => argv[1] === "--resume")).toBe(false);
+});
+
+// A background session that ended keeps its host process, so the pid is memory
+// still held rather than a writer still writing. This is the ordinary path.
+test("continues a finished session that still holds its host process", async () => {
+  const repo = await continuable("bridge-continue-host");
+  const recorder = staleRunner({
+    sessionId,
+    shortId: "44444444",
+    cwd: repo.root,
+    commonDir: repo.commonDir,
+    state: "done",
+    pid: 4242,
+  });
+
+  const result = await continueJob({
+    sessionId,
+    prompt: "address the owner feedback",
+    gitCommonDir: repo.commonDir,
+    process: recorder.process,
+    home: repo.home,
+  });
+
+  expect(result.manifest.sessionId).toBe(sessionId);
+  expect(result.actions).toEqual([]);
+  expect(
+    recorder.calls.some((argv) => argv[0] === "claude" && argv[1] === "stop"),
+  ).toBe(false);
+  expect(recorder.calls.some((argv) => argv[1] === "--resume")).toBe(true);
 });

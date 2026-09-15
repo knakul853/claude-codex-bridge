@@ -6,6 +6,7 @@ export type BridgeErrorCode =
   | "worktree_owner_active"
   | "session_still_running"
   | "termination_unconfirmed"
+  | "session_not_resumable"
   | "launch_unpublished";
 
 export class BridgeError extends Error {

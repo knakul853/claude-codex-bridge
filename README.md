@@ -90,6 +90,17 @@ printf '%s' 'Address the owner feedback and re-verify.' |
 Claude may implement a background resume as a new native session. The command
 prints that active session ID and carries the same Codex owner routing forward.
 
+`continue` decides on what the session is doing, not on the label the inventory
+shows. That label is the last one the daemon wrote: a worker that finished and
+handed over can still be listed as `blocked` or `working` long after its process
+is gone, because its background lease was never settled. Such a session is handed
+back through `claude stop` first — releasing the lease the daemon would otherwise
+revive a worker from — and the released lease is reported in `actions`. A session
+that is genuinely working, or waiting on a permission decision, is refused with
+`{"code":"session_not_resumable", ...}` and exit 5: answering that prompt is
+yours, and the bridge neither approves it nor resumes past it. A lease that
+refuses to settle is refused too, rather than resumed across.
+
 Claude can request Codex review for its current session. Choose an existing
 Codex task, or create a new durable task in Codex Desktop:
 
