@@ -428,7 +428,11 @@ async function main(): Promise<void> {
       prompt: await prompt(),
       gitCommonDir: repo.commonDir,
     });
-    emit({ ok: true, sessionId: continuation.sessionId });
+    emit({
+      ok: true,
+      sessionId: continuation.manifest.sessionId,
+      ...(continuation.actions.length ? { actions: continuation.actions } : {}),
+    });
     return;
   }
   if (command === "status") {
