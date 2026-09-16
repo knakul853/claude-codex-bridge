@@ -27,8 +27,12 @@ export interface NotifyResult {
   /** Whether the message was recorded on the lane. */
   queued: boolean;
   sessionId?: string;
-  /** Whether the socket nudge was attempted, and what came of it. */
-  pushed?: boolean;
+  /**
+   * Whether the socket took the nudge — not a delivery receipt. The addressee
+   * holds a message attesting no permission mode while it bypasses prompts,
+   * per its own `crossSessionInbound`. The lane is the durable record.
+   */
+  accepted?: boolean;
   detail?: string;
 }
 
@@ -98,7 +102,7 @@ export async function notifyClaude(input: NotifyInput): Promise<NotifyResult> {
       .filter(Boolean)
       .join("; ");
     if (!queued) throw new Error(`${detail}. The message was not delivered`);
-    return { ...result, pushed: false, detail };
+    return { ...result, accepted: false, detail };
   }
   const pushed = await pushToSession(
     target,
@@ -107,12 +111,12 @@ export async function notifyClaude(input: NotifyInput): Promise<NotifyResult> {
     input.sessionsRoot,
   );
   const detail = [laneDetail, pushed.detail].filter(Boolean).join("; ");
-  if (!queued && !pushed.delivered) {
+  if (!queued && !pushed.accepted) {
     throw new Error(`${detail}. The message was not delivered`);
   }
   return {
     ...result,
-    pushed: pushed.delivered,
+    accepted: pushed.accepted,
     ...(detail ? { detail } : {}),
   };
 }

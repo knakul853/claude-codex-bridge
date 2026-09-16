@@ -98,7 +98,7 @@ describe("notifyClaude", () => {
       sessionsRoot,
     });
     expect(result.sessionId).toBe(sessionA);
-    expect(result.pushed).toBe(false);
+    expect(result.accepted).toBe(false);
     expect(result.detail).toBeDefined();
     // The nudge failing must never cost the message.
     expect((await laneMessages(result.lane as string))[0]?.message).toBe(
@@ -225,9 +225,9 @@ describe("notifyClaude", () => {
         home,
         sessionsRoot,
       });
-      expect(result.pushed).toBe(true);
-      // A successful nudge must not replace the durable record: the socket
-      // acknowledges nothing, so it is never proof the session got it.
+      expect(result.accepted).toBe(true);
+      // This server discards the bytes, which is what a session holding the
+      // message looks like from here: the nudge never replaces the lane.
       expect((await laneMessages(result.lane)).map((m) => m.message)).toEqual([
         "both paths",
       ]);
@@ -275,7 +275,7 @@ describe("notifyClaude", () => {
         sessionsRoot,
       });
       expect(result.queued).toBe(false);
-      expect(result.pushed).toBe(true);
+      expect(result.accepted).toBe(true);
       expect(result.detail).toMatch(/lane unavailable/);
       expect(await waitForBytes(received)).toContain(
         "lane denied, socket open",

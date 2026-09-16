@@ -140,7 +140,8 @@ async function readPeerKey(
 }
 
 export interface PushResult {
-  delivered: boolean;
+  /** The socket took the bytes. The session decides afterwards, so never a receipt. */
+  accepted: boolean;
   detail?: string;
 }
 
@@ -148,8 +149,8 @@ export interface PushResult {
  * Writes an authenticated message straight into a live session's socket. This is
  * an undocumented Claude Code channel recovered from the binary, so every caller
  * must treat failure as normal and fall back to the inbox. The recipient still
- * gates the message behind its own permission mode, so delivery here means
- * "handed to the session", not "acted on".
+ * gates the message behind its own permission mode, so success here means
+ * "the socket took the bytes", not "the session acted on it".
  */
 export async function pushToSession(
   session: ClaudeSession,
@@ -158,13 +159,13 @@ export async function pushToSession(
   root?: string,
 ): Promise<PushResult> {
   const path = session.messagingSocketPath;
-  if (!path) return { delivered: false, detail: "session publishes no socket" };
+  if (!path) return { accepted: false, detail: "session publishes no socket" };
   const key = await readPeerKey(session.pid, root);
-  if (!key) return { delivered: false, detail: "no peer key published" };
+  if (!key) return { accepted: false, detail: "no peer key published" };
   // The socket is named by pid, which the OS reuses. Matching process start
   // times proves the listener is the session the record describes.
   if (key.procStart && session.procStart && key.procStart !== session.procStart)
-    return { delivered: false, detail: "peer key is stale for this pid" };
+    return { accepted: false, detail: "peer key is stale for this pid" };
 
   return new Promise<PushResult>((settle) => {
     let done = false;
@@ -177,7 +178,7 @@ export async function pushToSession(
     };
     const socket = connect(path);
     const timer = setTimeout(
-      () => finish({ delivered: false, detail: "socket timed out" }),
+      () => finish({ accepted: false, detail: "socket timed out" }),
       timeoutMs,
     );
     socket.on("connect", () => {
@@ -197,12 +198,12 @@ export async function pushToSession(
     socket.on("close", (hadError) =>
       finish(
         hadError
-          ? { delivered: false, detail: "socket closed with an error" }
-          : { delivered: true },
+          ? { accepted: false, detail: "socket closed with an error" }
+          : { accepted: true },
       ),
     );
     socket.on("error", (error) =>
-      finish({ delivered: false, detail: error.message }),
+      finish({ accepted: false, detail: error.message }),
     );
   });
 }

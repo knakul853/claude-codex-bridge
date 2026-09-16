@@ -119,7 +119,7 @@ describe("pushToSession", () => {
       { pid: 101, sessionId: sessionA, cwd: "/repo/a", kind: "interactive" },
       "hello",
     );
-    expect(result.delivered).toBe(false);
+    expect(result.accepted).toBe(false);
     expect(result.detail).toMatch(/no socket/);
   });
 
@@ -139,7 +139,7 @@ describe("pushToSession", () => {
       1_000,
       root,
     );
-    expect(result.delivered).toBe(false);
+    expect(result.accepted).toBe(false);
     expect(result.detail).toMatch(/no peer key/);
   });
 
@@ -163,7 +163,7 @@ describe("pushToSession", () => {
       1_000,
       root,
     );
-    expect(result.delivered).toBe(false);
+    expect(result.accepted).toBe(false);
     expect(result.detail).toMatch(/stale/);
   });
 
@@ -186,7 +186,7 @@ describe("pushToSession", () => {
       1_000,
       root,
     );
-    expect(result.delivered).toBe(false);
+    expect(result.accepted).toBe(false);
     expect(result.detail).toBeDefined();
   });
 });
