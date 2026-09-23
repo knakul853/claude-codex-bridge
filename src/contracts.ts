@@ -28,6 +28,9 @@ export interface BridgeManifest {
   name?: string;
   gitCommonDir: string;
   createdAt: string;
+  /** When this session was last resumed in place. A handover delivered before
+   * it belongs to a turn that is over, not to the one now running. */
+  resumedAt?: string;
 }
 
 export interface DeliveryRecord {
@@ -200,6 +203,7 @@ export function parseManifest(value: unknown): BridgeManifest {
     "gitCommonDir",
     "name",
     "ownerThreadId",
+    "resumedAt",
     "schemaVersion",
     "sessionId",
   ];
@@ -222,6 +226,9 @@ export function parseManifest(value: unknown): BridgeManifest {
   };
   if (record.name !== undefined) {
     manifest.name = boundedString(record.name, "name", 128);
+  }
+  if (record.resumedAt !== undefined) {
+    manifest.resumedAt = boundedString(record.resumedAt, "resume time");
   }
   return manifest;
 }

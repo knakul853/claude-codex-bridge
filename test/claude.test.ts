@@ -733,6 +733,7 @@ function staleRunner(input: {
   state: string;
   pid?: number;
   stopSettles?: boolean;
+  resumeFails?: boolean;
 }): { process: ProcessRunner; calls: string[][] } {
   const calls: string[][] = [];
   let settled = false;
@@ -745,12 +746,15 @@ function staleRunner(input: {
           if (input.stopSettles !== false) settled = true;
           return { stdout: "stopped\n", stderr: "", exitCode: 0 };
         }
-        if (argv[1] === "--resume")
+        if (argv[1] === "--resume") {
+          if (input.resumeFails)
+            throw new NativeCommandError("claude", 1, "resume refused");
           return {
             stdout: `backgrounded · ${input.shortId}\n`,
             stderr: "",
             exitCode: 0,
           };
+        }
         if (argv[1] === "agents")
           return {
             stdout: JSON.stringify([
@@ -865,8 +869,6 @@ test("refuses a session whose live process is waiting for a permission decision"
   expect(recorder.calls.some((argv) => argv[1] === "--resume")).toBe(false);
 });
 
-// The same "blocked" label over a worker that already delivered its handover is
-// a finished collaboration, which continue may reuse.
 test("continues a blocked session whose handover was delivered", async () => {
   const repo = await continuable("bridge-continue-delivered");
   const eventId = "b".repeat(64);
@@ -891,6 +893,81 @@ test("continues a blocked session whose handover was delivered", async () => {
 
   expect(result.manifest.sessionId).toBe(sessionId);
   expect(recorder.calls.some((argv) => argv[1] === "--resume")).toBe(true);
+});
+
+test("does not retire a resumed session on the handover of its previous turn", async () => {
+  const repo = await continuable("bridge-continue-epoch");
+  const previous = "c".repeat(64);
+  await claimDelivery(repo.commonDir, previous, sessionId);
+  await settleDelivery(repo.commonDir, previous, sessionId, "delivered");
+  const recorder = staleRunner({
+    sessionId,
+    shortId: "44444444",
+    cwd: repo.root,
+    commonDir: repo.commonDir,
+    state: "blocked",
+    pid: 4242,
+  });
+  await continueJob({
+    sessionId,
+    prompt: "address the owner feedback",
+    gitCommonDir: repo.commonDir,
+    process: recorder.process,
+    home: repo.home,
+  });
+
+  const resumed = await jobStatus({
+    sessionId,
+    gitCommonDir: repo.commonDir,
+    process: recorder.process,
+  });
+  expect(resumed.disposition).toBe("stuck");
+  expect(resumed.manifest.resumedAt).toBeDefined();
+
+  await Bun.sleep(2);
+  const current = "d".repeat(64);
+  await claimDelivery(repo.commonDir, current, sessionId);
+  await settleDelivery(repo.commonDir, current, sessionId, "delivered");
+  const settled = await jobStatus({
+    sessionId,
+    gitCommonDir: repo.commonDir,
+    process: recorder.process,
+  });
+  expect(settled.disposition).toBe("finished");
+});
+
+test("keeps the last delivered handover when a resume fails to launch", async () => {
+  const repo = await continuable("bridge-continue-epoch-failed");
+  const eventId = "e".repeat(64);
+  await claimDelivery(repo.commonDir, eventId, sessionId);
+  await settleDelivery(repo.commonDir, eventId, sessionId, "delivered");
+  const recorder = staleRunner({
+    sessionId,
+    shortId: "44444444",
+    cwd: repo.root,
+    commonDir: repo.commonDir,
+    state: "blocked",
+    pid: 4242,
+    resumeFails: true,
+  });
+
+  await expect(
+    continueJob({
+      sessionId,
+      prompt: "address the owner feedback",
+      gitCommonDir: repo.commonDir,
+      process: recorder.process,
+      home: repo.home,
+    }),
+  ).rejects.toThrow();
+
+  const status = await jobStatus({
+    sessionId,
+    gitCommonDir: repo.commonDir,
+    process: recorder.process,
+  });
+  expect(status.manifest.resumedAt).toBeUndefined();
+  expect(status.disposition).toBe("finished");
 });
 
 test("refuses to resume when the background lease will not settle", async () => {

@@ -747,9 +747,6 @@ describe("delivered handovers", () => {
     };
   }
 
-  // The native label stays "blocked" after a worker hands over and the daemon
-  // parks its host process. The delivered handover is the durable proof the
-  // work ended, and without it the sweep kept finished collaborations alive.
   test("reads a blocked label over an idle registry as finished once its handover was delivered", async () => {
     const peer = await blockedPeer("idle");
     await handedOver(peer.commonDir, delivered);
@@ -766,8 +763,6 @@ describe("delivered handovers", () => {
     expect(result.actions.join(" ")).toMatch(/would close/);
   });
 
-  // A worker continued after its handover and now waiting on a permission
-  // decision reports busy: the earlier delivery must not retire it.
   test("still calls a busy worker with an older delivered handover stuck", async () => {
     const peer = await blockedPeer("busy");
     await handedOver(peer.commonDir, delivered);
@@ -781,7 +776,6 @@ describe("delivered handovers", () => {
     expect(survey[0]?.disposition).toBe("stuck");
   });
 
-  // A claimed but unsettled event proves nothing reached the owner.
   test("leaves a blocked worker whose delivery never settled stuck", async () => {
     const peer = await blockedPeer("idle");
     await claimDelivery(peer.commonDir, eventId, delivered);

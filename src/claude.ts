@@ -549,8 +549,16 @@ async function resumeWorker(
     resumed = await launchedAgent(process, launch.stdout);
     await requireRepositoryBinding(process, resumed.cwd, manifest.gitCommonDir);
     if (resumed.sessionId === manifest.sessionId) {
+      // The session kept its id, so its earlier deliveries would otherwise
+      // read as this turn's handover. Stamped only once the resume launched:
+      // a failed one leaves the last delivered handover standing.
+      const resumedManifest = parseManifest({
+        ...manifest,
+        resumedAt: (input.now ?? (() => new Date().toISOString()))(),
+      });
+      await saveManifest(resumedManifest);
       await reservation.release();
-      return { manifest, actions };
+      return { manifest: resumedManifest, actions };
     }
     const continuation = parseManifest({
       ...manifest,

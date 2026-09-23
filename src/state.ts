@@ -79,23 +79,27 @@ export async function loadManifest(
 }
 
 /**
- * The sessions whose handover this repository has on record as delivered to the
- * owner. It is the one durable fact that a worker's own work ended: the native
- * state label outlives the turn it describes, and a delivery is only written
- * after the owner's thread took the message.
+ * When each session's latest handover was delivered to its owner, as this
+ * repository recorded it. A delivery is written only after the owner's thread
+ * took the message, which is why it, and not the native state label, is what
+ * proves a worker's own turn ended.
  */
 export async function deliveredSessions(
   gitCommonDir: string,
-): Promise<Set<string>> {
+): Promise<Map<string, string>> {
   const deliveries = join(stateRoot(gitCommonDir), "deliveries");
   const glob = new Bun.Glob("*.json");
-  const sessions = new Set<string>();
+  const latest = new Map<string, string>();
   try {
     for await (const name of glob.scan({ cwd: deliveries, onlyFiles: true })) {
       const path = join(deliveries, name);
       try {
         const record = parseDeliveryRecord(JSON.parse(await safeRead(path)));
-        if (record.status === "delivered") sessions.add(record.sessionId);
+        if (record.status !== "delivered") continue;
+        const known = latest.get(record.sessionId);
+        if (known === undefined || known < record.updatedAt) {
+          latest.set(record.sessionId, record.updatedAt);
+        }
       } catch {
         // A record being rewritten must not hide the others.
       }
@@ -103,13 +107,17 @@ export async function deliveredSessions(
   } catch (error) {
     if (!absent(error)) throw error;
   }
-  return sessions;
+  return latest;
 }
 
 /**
- * Which of the named workers have delivered a handover, reading each repository
- * once. A worker whose link never recorded its repository is left out rather
- * than guessed at.
+ * Which of the named workers have handed over the turn they are in now.
+ *
+ * A session resumed in place keeps its id, so its delivery records outlive the
+ * turn that wrote them: the manifest's resume time is the epoch each delivery
+ * is measured against, and only a handover delivered after the last resume
+ * describes the work running now. A worker whose link never recorded its
+ * repository is left out rather than guessed at.
  */
 export async function handedOverSessions(
   workers: Array<{ gitCommonDir?: string; sessionId?: string }>,
@@ -117,14 +125,20 @@ export async function handedOverSessions(
   const byRepository = new Map<string, Set<string>>();
   for (const worker of workers) {
     if (!worker.gitCommonDir || !worker.sessionId) continue;
-    const wanted = byRepository.get(worker.gitCommonDir) ?? new Set<string>([]);
+    const wanted = byRepository.get(worker.gitCommonDir) ?? new Set<string>();
     wanted.add(worker.sessionId);
     byRepository.set(worker.gitCommonDir, wanted);
   }
   const handedOver = new Set<string>();
   for (const [gitCommonDir, wanted] of byRepository) {
-    for (const sessionId of await deliveredSessions(gitCommonDir)) {
-      if (wanted.has(sessionId)) handedOver.add(sessionId);
+    const latest = await deliveredSessions(gitCommonDir);
+    for (const sessionId of wanted) {
+      const delivered = latest.get(sessionId);
+      if (delivered === undefined) continue;
+      const resumedAt = (await loadManifest(gitCommonDir, sessionId))
+        ?.resumedAt;
+      if (resumedAt === undefined || delivered > resumedAt)
+        handedOver.add(sessionId);
     }
   }
   return handedOver;
