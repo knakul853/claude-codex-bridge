@@ -1,5 +1,5 @@
 import { rm } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { type PeerLink, parsePeerLink } from "./contracts";
 import {
   absent,
@@ -15,6 +15,10 @@ export interface PeerIdentity {
   codexThreadId?: string;
   gitCommonDir?: string;
   label?: string;
+  /** The session this one continues, whose record it takes over. A resume that
+   * returns a fresh session id is the same worker in the same tree, not a new
+   * collaboration. */
+  supersedesSessionId?: string;
 }
 
 function peersRoot(home = bridgeHome()): string {
@@ -70,8 +74,45 @@ export async function findPeer(
   return matches[0];
 }
 
-// Upserts on either native id: registering the same collaboration twice fills in
-// the side that was unknown the first time instead of forking the link.
+function sameTree(a: string, b: string): boolean {
+  return resolve(a) === resolve(b);
+}
+
+function matches(link: PeerLink, identity: PeerIdentity): boolean {
+  if (
+    identity.claudeSessionId !== undefined &&
+    link.claudeSessionId === identity.claudeSessionId
+  ) {
+    return true;
+  }
+  if (
+    identity.supersedesSessionId !== undefined &&
+    link.claudeSessionId === identity.supersedesSessionId
+  ) {
+    return true;
+  }
+  // A link with no session yet is a placeholder for the worker its thread is
+  // about to start in that tree, so the first real session adopts it.
+  if (identity.claudeSessionId !== undefined && link.claudeSessionId) {
+    return false;
+  }
+  return (
+    identity.codexThreadId !== undefined &&
+    link.codexThreadId === identity.codexThreadId &&
+    sameTree(link.cwd, identity.cwd)
+  );
+}
+
+/**
+ * Upserts one worker's record.
+ *
+ * The key is the Claude worker — its session id, or the session it continues.
+ * A Codex thread owns as many workers as it starts, so matching on the thread
+ * alone made every sibling overwrite the last one: three parallel workers under
+ * one owner left one record carrying the newest tree and nothing of the other
+ * two. The thread only keys a link that has no Claude session yet, and then
+ * only within the same working tree.
+ */
 export async function linkPeer(
   identity: PeerIdentity,
   home?: string,
@@ -81,13 +122,7 @@ export async function linkPeer(
     throw new Error("a peer link needs a Claude session or a Codex thread");
   }
   const links = await listPeers(home);
-  const existing = links.find(
-    (link) =>
-      (identity.claudeSessionId !== undefined &&
-        link.claudeSessionId === identity.claudeSessionId) ||
-      (identity.codexThreadId !== undefined &&
-        link.codexThreadId === identity.codexThreadId),
-  );
+  const existing = links.find((link) => matches(link, identity));
   const timestamp = now();
   const link = parsePeerLink({
     schemaVersion: 1,

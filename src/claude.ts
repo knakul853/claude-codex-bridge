@@ -546,6 +546,7 @@ async function resumeWorker(
       {
         cwd: resumed.cwd,
         claudeSessionId: continuation.sessionId,
+        supersedesSessionId: manifest.sessionId,
         codexThreadId: continuation.ownerThreadId,
         gitCommonDir: continuation.gitCommonDir,
         ...(continuation.name ? { label: continuation.name } : {}),
@@ -651,19 +652,36 @@ export async function requestReview(input: {
   return { manifest, ...(created ? { response: created.response } : {}) };
 }
 
+/**
+ * What the session is doing, not the label it was last written with. The native
+ * state settles to "failed" while the worker is still writing, so reporting the
+ * agent record alone told the owner a live worker had died.
+ */
 export async function jobStatus(input: {
   sessionId: string;
   gitCommonDir: string;
   process?: ProcessRunner;
-}): Promise<{ manifest: BridgeManifest; agents: AgentRecord[] }> {
+}): Promise<{
+  manifest: BridgeManifest;
+  agents: AgentRecord[];
+  disposition: SessionFacts["disposition"];
+  facts?: SessionFacts;
+}> {
   const id = parseSessionId(input.sessionId);
   const manifest = await loadManifest(input.gitCommonDir, id);
   if (!manifest)
     throw new Error("bridge manifest was not found for this session");
-  const agents = (await inventory(input.process ?? nativeProcessRunner)).filter(
-    (agent) => agent.sessionId === id,
-  );
-  return { manifest, agents };
+  const runner = input.process ?? nativeProcessRunner;
+  const all = await inventory(runner);
+  const facts = (
+    await reconcileSessions({ sessionIds: [id], agents: all, runner })
+  ).get(id);
+  return {
+    manifest,
+    agents: all.filter((agent) => agent.sessionId === id),
+    disposition: facts?.disposition ?? "gone",
+    ...(facts ? { facts } : {}),
+  };
 }
 
 /**

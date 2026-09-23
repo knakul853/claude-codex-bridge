@@ -99,3 +99,70 @@ describe("peer registry", () => {
     expect(await findPeer("nobody", await home())).toBeUndefined();
   });
 });
+
+const claudeC = "33333333-3333-4333-8333-333333333333";
+
+describe("peers under one owner thread", () => {
+  const thread = "019fd8a9-4af5-7eb1-928c-550c219752ed";
+  const workers = [
+    { cwd: "/tmp/qa121a", claudeSessionId: claudeA, label: "QA-121a" },
+    { cwd: "/tmp/qa80", claudeSessionId: claudeB, label: "QA-80" },
+    { cwd: "/tmp/qa120b", claudeSessionId: claudeC, label: "QA-120b" },
+  ];
+
+  async function fleet(root: string) {
+    for (const worker of workers)
+      await linkPeer({ ...worker, codexThreadId: thread }, root);
+  }
+
+  test("keeps one record per worker instead of overwriting siblings", async () => {
+    const root = await home();
+    await fleet(root);
+    const links = await listPeers(root);
+    expect(links).toHaveLength(3);
+    expect(links.map((link) => link.cwd).sort()).toEqual(
+      workers.map((worker) => worker.cwd).sort(),
+    );
+    for (const worker of workers) {
+      const link = await findPeer(worker.claudeSessionId, root);
+      expect(link?.cwd).toBe(worker.cwd);
+      expect(link?.label).toBe(worker.label);
+      expect(link?.codexThreadId).toBe(thread);
+    }
+  });
+
+  test("closing one worker leaves its siblings untouched", async () => {
+    const root = await home();
+    await fleet(root);
+    const doomed = await findPeer(claudeB, root);
+    await unlinkPeer(doomed?.id as string, root);
+    const links = await listPeers(root);
+    expect(links).toHaveLength(2);
+    expect((await findPeer(claudeA, root))?.cwd).toBe("/tmp/qa121a");
+    expect((await findPeer(claudeC, root))?.cwd).toBe("/tmp/qa120b");
+  });
+
+  test("refuses to guess which sibling an owner thread means", async () => {
+    const root = await home();
+    await fleet(root);
+    await expect(findPeer(thread, root)).rejects.toThrow(/3 peers match/);
+  });
+
+  test("a resumed worker replaces its own record rather than adding one", async () => {
+    const root = await home();
+    await fleet(root);
+    const resumed = await linkPeer(
+      {
+        cwd: "/tmp/qa80",
+        claudeSessionId: claudeC.replace(/^3/, "4"),
+        codexThreadId: thread,
+        label: "QA-80",
+        supersedesSessionId: claudeB,
+      },
+      root,
+    );
+    expect(await listPeers(root)).toHaveLength(3);
+    expect(await findPeer(claudeB, root)).toBeUndefined();
+    expect(resumed.cwd).toBe("/tmp/qa80");
+  });
+});
