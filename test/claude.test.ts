@@ -734,6 +734,7 @@ function staleRunner(input: {
   pid?: number;
   stopSettles?: boolean;
   resumeFails?: boolean;
+  onResume?: () => Promise<void>;
 }): { process: ProcessRunner; calls: string[][] } {
   const calls: string[][] = [];
   let settled = false;
@@ -749,6 +750,7 @@ function staleRunner(input: {
         if (argv[1] === "--resume") {
           if (input.resumeFails)
             throw new NativeCommandError("claude", 1, "resume refused");
+          await input.onResume?.();
           return {
             stdout: `backgrounded · ${input.shortId}\n`,
             stderr: "",
@@ -934,6 +936,49 @@ test("does not retire a resumed session on the handover of its previous turn", a
     process: recorder.process,
   });
   expect(settled.disposition).toBe("finished");
+});
+
+test("counts a handover delivered while the resumed worker is launching", async () => {
+  const repo = await continuable("bridge-continue-immediate-handover");
+  const previous = "f".repeat(64);
+  await claimDelivery(repo.commonDir, previous, sessionId);
+  await settleDelivery(repo.commonDir, previous, sessionId, "delivered");
+  const current = "a".repeat(64);
+  const resumedAt = "2026-09-23T00:00:00.000Z";
+  const recorder = staleRunner({
+    sessionId,
+    shortId: "44444444",
+    cwd: repo.root,
+    commonDir: repo.commonDir,
+    state: "blocked",
+    pid: 4242,
+    onResume: async () => {
+      await claimDelivery(repo.commonDir, current, sessionId, () => resumedAt);
+      await settleDelivery(
+        repo.commonDir,
+        current,
+        sessionId,
+        "delivered",
+        () => resumedAt,
+      );
+    },
+  });
+
+  await continueJob({
+    sessionId,
+    prompt: "address the owner feedback",
+    gitCommonDir: repo.commonDir,
+    process: recorder.process,
+    home: repo.home,
+    now: () => resumedAt,
+  });
+
+  const status = await jobStatus({
+    sessionId,
+    gitCommonDir: repo.commonDir,
+    process: recorder.process,
+  });
+  expect(status.disposition).toBe("finished");
 });
 
 test("keeps the last delivered handover when a resume fails to launch", async () => {

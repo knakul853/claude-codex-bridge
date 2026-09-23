@@ -137,7 +137,7 @@ export async function handedOverSessions(
       if (delivered === undefined) continue;
       const resumedAt = (await loadManifest(gitCommonDir, sessionId))
         ?.resumedAt;
-      if (resumedAt === undefined || delivered > resumedAt)
+      if (resumedAt === undefined || delivered >= resumedAt)
         handedOver.add(sessionId);
     }
   }
@@ -168,6 +168,7 @@ export async function claimDelivery(
   gitCommonDir: string,
   eventId: string,
   sessionId: string,
+  now: () => string = () => new Date().toISOString(),
 ): Promise<boolean> {
   const path = deliveryPath(gitCommonDir, eventId);
   await ensurePrivateDirectory(stateRoot(gitCommonDir));
@@ -177,7 +178,7 @@ export async function claimDelivery(
     eventId,
     sessionId: parseSessionId(sessionId),
     status: "pending",
-    updatedAt: new Date().toISOString(),
+    updatedAt: now(),
   };
   try {
     const handle = await open(
@@ -207,6 +208,7 @@ export async function settleDelivery(
   eventId: string,
   sessionId: string,
   status: Exclude<DeliveryStatus, "pending">,
+  now: () => string = () => new Date().toISOString(),
 ): Promise<void> {
   await ensurePrivateDirectory(stateRoot(gitCommonDir));
   const current = await loadDelivery(gitCommonDir, eventId);
@@ -222,7 +224,7 @@ export async function settleDelivery(
     eventId,
     sessionId: current.sessionId,
     status,
-    updatedAt: new Date().toISOString(),
+    updatedAt: now(),
   } satisfies DeliveryRecord);
 }
 

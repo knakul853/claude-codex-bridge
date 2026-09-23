@@ -540,6 +540,7 @@ async function resumeWorker(
     });
     actions.push(...settled.actions);
     await requireFreeWorktree(agent.cwd, settled.agents, process, input.home);
+    const resumedAt = (input.now ?? (() => new Date().toISOString()))();
     const launch = await process.run(
       ["claude", "--resume", id, "--bg", withHandoverContract(input.prompt)],
       {
@@ -554,7 +555,7 @@ async function resumeWorker(
       // a failed one leaves the last delivered handover standing.
       const resumedManifest = parseManifest({
         ...manifest,
-        resumedAt: (input.now ?? (() => new Date().toISOString()))(),
+        resumedAt,
       });
       await saveManifest(resumedManifest);
       await reservation.release();
