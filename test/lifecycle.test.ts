@@ -615,3 +615,93 @@ describe("closePeer", () => {
     ).rejects.toThrow(/no peer matches/);
   });
 });
+
+describe("parallel workers under one owner thread", () => {
+  const thread = "019fd8a9-4af5-7eb1-928c-550c219752ed";
+  const trees = {
+    [working]: "/tmp/qa121a",
+    [stuck]: "/tmp/qa80",
+    [finished]: "/tmp/qa120b",
+  } as const;
+
+  async function fleet(): Promise<string> {
+    const home = await temporary("bridge-life-home-");
+    for (const [claudeSessionId, cwd] of Object.entries(trees)) {
+      await linkPeer({ cwd, claudeSessionId, codexThreadId: thread }, home);
+    }
+    return home;
+  }
+
+  async function fleetRunner() {
+    await sessionRegistry([
+      {
+        pid: 101,
+        sessionId: working,
+        cwd: trees[working],
+        kind: "background",
+        status: "busy",
+      },
+      { pid: 303, sessionId: stuck, cwd: trees[stuck], kind: "background" },
+    ]);
+    return runner(
+      [
+        { sessionId: working, cwd: trees[working], pid: 101, state: "failed" },
+        { sessionId: stuck, cwd: trees[stuck], pid: 303, state: "blocked" },
+        { sessionId: finished, cwd: trees[finished], state: "done" },
+      ],
+      {
+        live: [
+          ...claudeTree(101, 102, "qa121a"),
+          ...claudeTree(303, 304, "qa80"),
+        ],
+      },
+    );
+  }
+
+  test("surveys every sibling rather than the newest one", async () => {
+    const home = await fleet();
+    const survey = await surveyPeers((await fleetRunner()).process, home);
+    expect(survey).toHaveLength(3);
+    expect(
+      Object.fromEntries(
+        survey.map((entry) => [entry.peer.cwd, entry.disposition]),
+      ),
+    ).toEqual({
+      [trees[working]]: "working",
+      [trees[stuck]]: "stuck",
+      [trees[finished]]: "finished",
+    });
+  });
+
+  test("closing one sibling leaves the others linked", async () => {
+    const home = await fleet();
+    const target = (await listPeers(home)).find(
+      (peer) => peer.claudeSessionId === finished,
+    );
+    await closePeer({
+      reference: target?.id as string,
+      process: (await fleetRunner()).process,
+      home,
+      ...quiet,
+    });
+    const left = await listPeers(home);
+    expect(left).toHaveLength(2);
+    expect(left.map((peer) => peer.claudeSessionId).sort()).toEqual(
+      [working, stuck].sort(),
+    );
+  });
+
+  test("reaping sweeps the ended worker and spares the live ones", async () => {
+    const home = await fleet();
+    const result = await reapPeers({
+      apply: true,
+      process: (await fleetRunner()).process,
+      home,
+      ...quiet,
+    });
+    expect(result.unresolved).toEqual([]);
+    expect((await listPeers(home)).map((peer) => peer.cwd).sort()).toEqual(
+      [trees[working], trees[stuck]].sort(),
+    );
+  });
+});

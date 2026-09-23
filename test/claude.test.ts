@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { continueJob, forgetJob, startJob } from "../src/claude";
+import { continueJob, forgetJob, jobStatus, startJob } from "../src/claude";
 import { BridgeError } from "../src/errors";
 import { linkPeer, listPeers } from "../src/peers";
 import { NativeCommandError, type ProcessRunner } from "../src/process";
@@ -911,4 +911,39 @@ test("continues a finished session that still holds its host process", async () 
     recorder.calls.some((argv) => argv[0] === "claude" && argv[1] === "stop"),
   ).toBe(false);
   expect(recorder.calls.some((argv) => argv[1] === "--resume")).toBe(true);
+});
+
+test("status reports what a session is doing, not the label it was left with", async () => {
+  const repo = await repository("bridge-status");
+  const worker = join(repo.root, "worker");
+  await mkdir(worker);
+  await writeManifest({
+    schemaVersion: 1,
+    sessionId,
+    ownerThreadId: owner,
+    gitCommonDir: repo.commonDir,
+    createdAt: "2026-09-23T00:00:00.000Z",
+  });
+  await writeFile(
+    join(repo.sessions, "4388.json"),
+    JSON.stringify({
+      pid: 4388,
+      sessionId,
+      cwd: worker,
+      kind: "background",
+      status: "busy",
+    }),
+    "utf8",
+  );
+  const status = await jobStatus({
+    sessionId,
+    gitCommonDir: repo.commonDir,
+    process: ownerRunner(
+      [{ id: "44444444", sessionId, cwd: worker, pid: 4388, state: "failed" }],
+      repo.commonDir,
+      [{ pid: 4388, command: "/opt/claude/versions/2.1.0 --resume x" }],
+    ),
+  });
+  expect(status.facts?.state).toBe("failed");
+  expect(status.disposition).toBe("working");
 });
