@@ -50,3 +50,22 @@ test("install and uninstall commands preserve unrelated user hooks", async () =>
   expect(removed).not.toContain("claude-codex-bridge hook");
   expect(removed).toContain("keep");
 });
+
+test("send refuses an empty message instead of submitting nothing", async () => {
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      cli,
+      "send",
+      "--thread",
+      "t1",
+      "--steer",
+      "--message",
+      "  ",
+    ],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+  const stderr = await new Response(child.stderr).text();
+  expect(await child.exited).toBe(2);
+  expect(stderr).toContain("send needs a message");
+});

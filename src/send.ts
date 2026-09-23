@@ -1,9 +1,10 @@
-import { existsSync } from "node:fs";
-import { resolve as resolvePath } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve as resolvePath } from "node:path";
 import type { CodexReviewClient } from "./codex";
 import type { ProcessRunner } from "./process";
 import {
   type CodexThread,
+  defaultCodexHome,
   type MessageScan,
   readAssistantMessages,
   resolveProject,
@@ -63,9 +64,47 @@ export interface WaitOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
+/**
+ * How a message reaches a thread that may be mid-turn.
+ *
+ * `queue` hands it to `codex queue`, which writes the shared queue store; the
+ * desktop app drains that queue only when the running turn ends, and its payload
+ * carries no field that could ask for more. `steer` puts the message in front of
+ * the running turn instead, the way a person does: it opens the thread in the
+ * desktop app with the message in the composer and submits it there, and the app
+ * calls `turn/steer` while a turn is in progress (`turn/start` when idle).
+ */
+export type Delivery = "queue" | "steer";
+
+/** Default delivery for callers that pass neither `--steer` nor `--queue`. */
+export const DELIVERY_ENV = "CLAUDE_CODEX_BRIDGE_DELIVERY";
+
+const DELIVERIES: readonly Delivery[] = ["queue", "steer"];
+
+export function resolveDelivery(input: {
+  steer: boolean;
+  queue: boolean;
+  env?: string | undefined;
+}): Delivery {
+  if (input.steer && input.queue) {
+    throw new Error("pass --steer or --queue, not both");
+  }
+  if (input.steer) return "steer";
+  if (input.queue) return "queue";
+  const configured = input.env?.trim();
+  if (!configured) return "queue";
+  if ((DELIVERIES as readonly string[]).includes(configured)) {
+    return configured as Delivery;
+  }
+  throw new Error(
+    `${DELIVERY_ENV} must be one of ${DELIVERIES.join(", ")}, not "${configured}"`,
+  );
+}
+
 export interface SendResult {
   threadId: string;
   label: string;
+  delivery: Delivery;
   reply?: string;
   timedOut: boolean;
 }
@@ -79,6 +118,12 @@ export interface SendResult {
 export function desktopThreadUrl(workspace: string, message: string): string {
   const params = new URLSearchParams({ workspace, prompt: message });
   return `codex://threads/new?${params.toString()}`;
+}
+
+/** Opens a thread that already exists, with the message waiting in its composer. */
+export function existingThreadUrl(threadId: string, message: string): string {
+  const params = new URLSearchParams({ prompt: message });
+  return `codex://threads/${encodeURIComponent(threadId)}?${params.toString()}`;
 }
 
 const DESKTOP_APPS = ["/Applications/ChatGPT.app", "/Applications/Codex.app"];
@@ -165,16 +210,65 @@ export function appProcessName(appPath: string): string {
  * refuses to type if something else is still in front, and addresses the
  * keystroke to the process rather than the screen.
  */
-export function autoSendScript(appName: string): string {
+export function autoSendScript(
+  appName: string,
+  keystroke = "keystroke return",
+): string {
   return [
     `tell application "${appName}" to activate`,
     "delay 0.4",
     'tell application "System Events"',
     "  set frontApp to name of first application process whose frontmost is true",
     `  if frontApp is not "${appName}" then error "focus moved to " & frontApp & "; nothing was typed"`,
-    `  tell process "${appName}" to keystroke return`,
+    `  tell process "${appName}" to ${keystroke}`,
     "end tell",
   ].join("\n");
+}
+
+export interface ComposerSettings {
+  followUpQueueMode: "queue" | "steer";
+  composerEnterBehavior: "enter" | "cmdIfMultiline" | "cmdAlways";
+}
+
+/**
+ * The desktop's own `[desktop]` settings decide what a submit during a turn
+ * does, so they are read rather than assumed. Unknown or missing values fall
+ * back to the desktop's defaults.
+ */
+export function readComposerSettings(
+  configPath = join(defaultCodexHome(), "config.toml"),
+): ComposerSettings {
+  let desktop: Record<string, unknown> = {};
+  if (existsSync(configPath)) {
+    const parsed = Bun.TOML.parse(readFileSync(configPath, "utf8")) as {
+      desktop?: Record<string, unknown>;
+    };
+    desktop = parsed.desktop ?? {};
+  }
+  const enter = desktop.composerEnterBehavior;
+  return {
+    followUpQueueMode:
+      desktop.followUpQueueMode === "queue" ? "queue" : "steer",
+    composerEnterBehavior:
+      enter === "cmdIfMultiline" || enter === "cmdAlways" ? enter : "enter",
+  };
+}
+
+/**
+ * The key that steers a running turn. With follow-ups set to queue, plain
+ * submit would queue, so this presses the desktop's one-message invert
+ * shortcut: Cmd+Enter, or Cmd+Shift+Enter when Enter alone inserts a newline.
+ */
+export function steerKeystroke(settings: ComposerSettings): string {
+  const enterSubmits = settings.composerEnterBehavior === "enter";
+  if (settings.followUpQueueMode === "steer") {
+    return enterSubmits
+      ? "keystroke return"
+      : "keystroke return using command down";
+  }
+  return enterSubmits
+    ? "keystroke return using command down"
+    : "keystroke return using {command down, shift down}";
 }
 
 // No query parameter submits the composer, so return has to be pressed, and the
@@ -297,8 +391,6 @@ export async function openThreadInDesktop(
   };
 }
 
-// The queue call returns as soon as Codex accepts the message, so a reply is
-// only observable by watching the thread's rollout grow.
 export async function sendToThread(
   store: ThreadStore,
   client: CodexReviewClient,
@@ -307,16 +399,83 @@ export async function sendToThread(
   wait?: WaitOptions,
 ): Promise<SendResult> {
   const thread = resolveThread(store, target);
-  const before = thread.rolloutPath
+  const before = await assistantCount(thread);
+  await client.queue(thread.id, message);
+  return awaitReply(thread, "queue", before, wait);
+}
+
+export interface SteerOptions {
+  composerMs: number;
+  sleep?: (ms: number) => Promise<void>;
+  /** Bundle to open; `null` means none is installed. Discovered when omitted. */
+  app?: string | null;
+  /** Read from the Codex config when omitted. */
+  composer?: ComposerSettings;
+}
+
+/**
+ * Delivers a message into the thread's running turn instead of behind it.
+ *
+ * The turn lives in the desktop app's own app-server, which speaks only to its
+ * Electron parent, so nothing outside the app can call `turn/steer` on it. The
+ * app itself does, whenever its composer is submitted during a turn — so this
+ * opens the thread with the message prefilled and submits it with the
+ * focus-checked keystroke that steers under the desktop's follow-up setting. A keystroke refused because another
+ * window held focus leaves the message in the composer, unsent, and says so.
+ */
+export async function steerThread(
+  store: ThreadStore,
+  process: ProcessRunner,
+  target: SendTarget,
+  message: string,
+  submit: SteerOptions,
+  wait?: WaitOptions,
+): Promise<SendResult> {
+  const thread = resolveThread(store, target);
+  const app = submit.app === undefined ? desktopAppPath() : submit.app;
+  if (!app) {
+    throw new Error(
+      "steering needs the Codex desktop app, which owns the running turn; set CODEX_DESKTOP_APP or use --queue",
+    );
+  }
+  const before = await assistantCount(thread);
+  await process.run(openUrlArgv(existingThreadUrl(thread.id, message), app));
+  const sleep =
+    submit.sleep ??
+    ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+  await sleep(submit.composerMs);
+  try {
+    const keystroke = steerKeystroke(submit.composer ?? readComposerSettings());
+    await process.run([
+      "osascript",
+      "-e",
+      autoSendScript(appProcessName(app), keystroke),
+    ]);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `the message was left in the composer of thread ${thread.id}, not sent: ${detail}`,
+    );
+  }
+  return awaitReply(thread, "steer", before, wait);
+}
+
+async function assistantCount(thread: CodexThread): Promise<number> {
+  return thread.rolloutPath
     ? (await readAssistantMessages(thread.rolloutPath)).length
     : 0;
+}
 
-  await client.queue(thread.id, message);
-
-  if (!wait || !thread.rolloutPath) {
-    return { threadId: thread.id, label: thread.label, timedOut: false };
-  }
-
+// Either delivery returns as soon as the message is handed over, so a reply is
+// only observable by watching the thread's rollout grow.
+async function awaitReply(
+  thread: CodexThread,
+  delivery: Delivery,
+  before: number,
+  wait?: WaitOptions,
+): Promise<SendResult> {
+  const settled = { threadId: thread.id, label: thread.label, delivery };
+  if (!wait || !thread.rolloutPath) return { ...settled, timedOut: false };
   const now = wait.now ?? (() => Date.now());
   const sleep =
     wait.sleep ??
@@ -327,14 +486,13 @@ export async function sendToThread(
     const messages = await readAssistantMessages(thread.rolloutPath);
     if (messages.length > before) {
       return {
-        threadId: thread.id,
-        label: thread.label,
+        ...settled,
         reply: messages[messages.length - 1]?.text,
         timedOut: false,
       };
     }
   }
-  return { threadId: thread.id, label: thread.label, timedOut: true };
+  return { ...settled, timedOut: true };
 }
 
 export interface WatchDeps {

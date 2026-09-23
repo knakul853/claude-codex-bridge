@@ -219,6 +219,7 @@ claude-codex-bridge projects                          # projects and their root 
 claude-codex-bridge threads --cwd /path/to/repo       # newest first
 claude-codex-bridge send --cwd /path/to/repo --new --message "..."
 claude-codex-bridge send --thread <uuid> --message "..." --wait
+claude-codex-bridge send --thread <uuid> --message "..." --steer   # into the running turn
 claude-codex-bridge read --thread <uuid> --last 3
 claude-codex-bridge watch --thread <uuid>             # block until the next turn
 ```
@@ -239,6 +240,17 @@ the thread, and must not be used to detect that something arrived.
 `send --new` opens the desktop app on the project, prefills the composer, presses
 return, then waits for the thread to register and prints its id. Pass `--no-send` to
 stop before the keystroke and approve the message yourself.
+
+`send --thread` queues by default: the message waits until the thread's current turn
+ends. Pass `--steer` to deliver it into the running turn instead, or set
+`CLAUDE_CODEX_BRIDGE_DELIVERY=steer` to make that the default (`--queue` overrides it
+for one call). Steering opens the thread in the desktop app with the message
+prefilled and submits it with the focus-checked keystroke, so the app takes focus
+for a few seconds. The key is chosen from the app's own `[desktop]` settings in
+`~/.codex/config.toml`: with **Follow-up behavior** set to Queue it presses the
+one-message invert shortcut, Cmd+Enter, or Cmd+Shift+Enter when Enter inserts a
+newline. If another window holds focus, nothing is typed and the message stays in
+the composer, unsent.
 
 ### Codex sending a message back
 
@@ -306,6 +318,15 @@ left for the next agent to rediscover.
   reply is only visible by reading the thread's rollout, which is what `--wait` and `read`
   do. Rollouts are append-only and reach hundreds of megabytes, so only a bounded tail is
   ever read.
+- **A queued message cannot steer.** `codex queue` writes the shared queue, which
+  the desktop drains only when a turn ends; the item has no delivery mode. Steering
+  exists only as `turn/steer` on the app-server that owns the turn, and the desktop
+  calls it only when its composer is submitted mid-turn. That is why `--steer`
+  submits through the composer.
+- **Mid-turn submit follows a setting.** The desktop's `followUpQueueMode` decides
+  whether a submit during a turn steers or queues, and plain return obeys it. Only
+  the invert shortcut does the opposite, and which shortcut depends on
+  `composerEnterBehavior`, so both are read rather than assumed.
 - **The running app-server is unreachable.** It is launched as `app-server --listen
   stdio://` by the Electron app and speaks only to its parent, so `codex app-server proxy`
   cannot attach. Everything here goes through the CLI and the local store instead.

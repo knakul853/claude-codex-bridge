@@ -25,7 +25,14 @@ import { notifyClaude } from "./notify";
 import { listPeers } from "./peers";
 import { nativeProcessRunner } from "./process";
 import { readRepositoryState } from "./repository";
-import { openThreadInDesktop, sendToThread, watchForReply } from "./send";
+import {
+  DELIVERY_ENV,
+  openThreadInDesktop,
+  resolveDelivery,
+  sendToThread,
+  steerThread,
+  watchForReply,
+} from "./send";
 import { currentSessionId, listClaudeSessions } from "./sessions";
 import {
   claudeSettingsPath,
@@ -55,6 +62,10 @@ Codex desktop app (has computer use and your browser sessions):
       [--composer-delay S] [--timeout S] [--poll S]
   send --thread UUID --message TEXT [--wait] queue into an existing thread
   send --cwd PATH --message TEXT [--wait]    queue into that directory's newest
+      [--steer]                              deliver into the running turn now,
+                                             through the desktop app, instead
+                                             of after it; see ${DELIVERY_ENV}
+      [--queue]                              queue even when that default is steer
   read --thread UUID [--last N]              assistant turns from the thread
   watch --thread UUID [--timeout S]          block on fs events until the next
                                              assistant turn; exit 3 on timeout
@@ -346,6 +357,12 @@ async function main(): Promise<void> {
   }
   if (command === "send") {
     const message = option("--message") ?? (await prompt());
+    if (message.trim() === "") {
+      throw new CliError(
+        "send needs a message: --message, stdin or --prompt-file",
+        2,
+      );
+    }
     const thread = option("--thread");
     const project = option("--project");
     const cwd = option("--cwd");
@@ -374,19 +391,34 @@ async function main(): Promise<void> {
       );
       return;
     }
+    const wait = flag("--wait")
+      ? {
+          timeoutMs: Number(option("--timeout") ?? 900) * 1_000,
+          pollMs: Number(option("--poll") ?? 5) * 1_000,
+        }
+      : undefined;
+    const delivery = resolveDelivery({
+      steer: flag("--steer"),
+      queue: flag("--queue"),
+      env: process.env[DELIVERY_ENV],
+    });
     emit(
-      await sendToThread(
-        SqliteThreadStore.open(),
-        new NativeCodexReviewClient(),
-        target,
-        message,
-        flag("--wait")
-          ? {
-              timeoutMs: Number(option("--timeout") ?? 900) * 1_000,
-              pollMs: Number(option("--poll") ?? 5) * 1_000,
-            }
-          : undefined,
-      ),
+      delivery === "steer"
+        ? await steerThread(
+            SqliteThreadStore.open(),
+            nativeProcessRunner,
+            target,
+            message,
+            { composerMs: Number(option("--composer-delay") ?? 3) * 1_000 },
+            wait,
+          )
+        : await sendToThread(
+            SqliteThreadStore.open(),
+            new NativeCodexReviewClient(),
+            target,
+            message,
+            wait,
+          ),
     );
     return;
   }

@@ -7,11 +7,16 @@ import {
   appProcessName,
   autoSendScript,
   desktopThreadUrl,
+  existingThreadUrl,
   openThreadInDesktop,
   openUrlArgv,
+  readComposerSettings,
+  resolveDelivery,
   resolveThread,
   resolveWorkspace,
   sendToThread,
+  steerKeystroke,
+  steerThread,
   watchForReply,
   workspaceWarning,
 } from "../src/send";
@@ -268,6 +273,7 @@ describe("sendToThread", () => {
     expect(result).toEqual({
       threadId: "t9",
       label: "QA run",
+      delivery: "queue",
       timedOut: false,
     });
   });
@@ -558,5 +564,221 @@ describe("watchForReply", () => {
       0,
     );
     expect(result.timedOut).toBe(true);
+  });
+});
+
+describe("resolveDelivery", () => {
+  test("queues by default", () => {
+    expect(resolveDelivery({ steer: false, queue: false })).toBe("queue");
+  });
+
+  test("takes the default from the environment", () => {
+    expect(resolveDelivery({ steer: false, queue: false, env: "steer" })).toBe(
+      "steer",
+    );
+  });
+
+  test("lets a flag override the environment", () => {
+    expect(resolveDelivery({ steer: false, queue: true, env: "steer" })).toBe(
+      "queue",
+    );
+    expect(resolveDelivery({ steer: true, queue: false, env: "queue" })).toBe(
+      "steer",
+    );
+  });
+
+  test("refuses both flags at once", () => {
+    expect(() => resolveDelivery({ steer: true, queue: true })).toThrow(
+      /--steer or --queue/,
+    );
+  });
+
+  test("names the allowed values when the environment holds another", () => {
+    expect(() =>
+      resolveDelivery({ steer: false, queue: false, env: "now" }),
+    ).toThrow(/queue, steer/);
+  });
+});
+
+describe("existingThreadUrl", () => {
+  test("opens the existing thread with the message in its composer", () => {
+    const url = new URL(existingThreadUrl("019fd8a9-4af5", "stop & look"));
+    expect(url.protocol).toBe("codex:");
+    expect(`${url.host}${url.pathname}`).toBe("threads/019fd8a9-4af5");
+    expect(url.searchParams.get("prompt")).toBe("stop & look");
+  });
+});
+
+describe("readComposerSettings", () => {
+  test("reads the desktop follow-up and enter settings", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "codex-config-"));
+    const path = join(dir, "config.toml");
+    await writeFile(
+      path,
+      'model = "x"\n\n[desktop]\nfollowUpQueueMode = "queue"\ncomposerEnterBehavior = "cmdAlways"\n',
+    );
+    expect(readComposerSettings(path)).toEqual({
+      followUpQueueMode: "queue",
+      composerEnterBehavior: "cmdAlways",
+    });
+  });
+
+  test("falls back to the desktop defaults", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "codex-config-"));
+    const path = join(dir, "config.toml");
+    await writeFile(path, '[desktop]\nfollowUpQueueMode = "sideways"\n');
+    const defaults = {
+      followUpQueueMode: "steer",
+      composerEnterBehavior: "enter",
+    } as const;
+    expect(readComposerSettings(path)).toEqual(defaults);
+    expect(readComposerSettings(join(dir, "missing.toml"))).toEqual(defaults);
+  });
+});
+
+describe("steerKeystroke", () => {
+  test.each([
+    ["steer", "enter", "keystroke return"],
+    ["steer", "cmdAlways", "keystroke return using command down"],
+    ["queue", "enter", "keystroke return using command down"],
+    [
+      "queue",
+      "cmdIfMultiline",
+      "keystroke return using {command down, shift down}",
+    ],
+  ] as const)("%s follow-ups with %s submit press %s", (mode, enter, key) => {
+    expect(
+      steerKeystroke({ followUpQueueMode: mode, composerEnterBehavior: enter }),
+    ).toBe(key);
+  });
+});
+
+describe("steerThread", () => {
+  const steering = {
+    followUpQueueMode: "steer",
+    composerEnterBehavior: "enter",
+  } as const;
+  const desktop = (failKeystroke?: string) => {
+    const ran: string[][] = [];
+    return {
+      ran,
+      run: async (argv: string[]) => {
+        ran.push(argv);
+        if (failKeystroke && argv[0] === "osascript") {
+          throw new Error(failKeystroke);
+        }
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    };
+  };
+
+  test("submits through the desktop app instead of the queue", async () => {
+    const process = desktop();
+    const result = await steerThread(
+      store([thread({ id: "t1" })]),
+      process,
+      { thread: "t1" },
+      "look now",
+      {
+        composerMs: 1,
+        sleep: async () => {},
+        app: "/Applications/Codex.app",
+        composer: steering,
+      },
+    );
+    expect(process.ran[0]).toEqual([
+      "open",
+      "-a",
+      "/Applications/Codex.app",
+      existingThreadUrl("t1", "look now"),
+    ]);
+    expect(process.ran[1]?.[0]).toBe("osascript");
+    expect(process.ran[1]?.[2]).toContain(
+      'tell process "Codex" to keystroke return',
+    );
+    expect(result).toEqual({
+      threadId: "t1",
+      label: "QA run",
+      delivery: "steer",
+      timedOut: false,
+    });
+  });
+
+  test("presses the invert shortcut when follow-ups queue", async () => {
+    const process = desktop();
+    await steerThread(
+      store([thread({ id: "t1" })]),
+      process,
+      { thread: "t1" },
+      "look now",
+      {
+        composerMs: 1,
+        sleep: async () => {},
+        app: "/Applications/Codex.app",
+        composer: {
+          followUpQueueMode: "queue",
+          composerEnterBehavior: "enter",
+        },
+      },
+    );
+    expect(process.ran[1]?.[2]).toContain(
+      'tell process "Codex" to keystroke return using command down',
+    );
+  });
+
+  test("says the message is still in the composer when focus moved", async () => {
+    await expect(
+      steerThread(
+        store([thread({ id: "t1" })]),
+        desktop("focus moved to Slack; nothing was typed"),
+        { thread: "t1" },
+        "look now",
+        {
+          composerMs: 1,
+          sleep: async () => {},
+          app: "/Applications/Codex.app",
+          composer: steering,
+        },
+      ),
+    ).rejects.toThrow(/left in the composer/);
+  });
+
+  test("needs the desktop app, which owns the running turn", async () => {
+    await expect(
+      steerThread(
+        store([thread({ id: "t1" })]),
+        desktop(),
+        { thread: "t1" },
+        "look now",
+        { composerMs: 1, sleep: async () => {}, app: null },
+      ),
+    ).rejects.toThrow(/desktop app/);
+  });
+
+  test("waits for the next reply like a queued send", async () => {
+    const path = await rolloutWith(["earlier reply"]);
+    const result = await steerThread(
+      store([thread({ id: "t1", rolloutPath: path })]),
+      desktop(),
+      { thread: "t1" },
+      "look now",
+      {
+        composerMs: 1,
+        sleep: async () => {},
+        app: "/Applications/Codex.app",
+        composer: steering,
+      },
+      {
+        timeoutMs: 1_000,
+        pollMs: 1,
+        sleep: async () => {
+          await writeFile(path, `${assistantLine("steered reply")}\n`, {
+            flag: "a",
+          });
+        },
+      },
+    );
+    expect(result.reply).toBe("steered reply");
+    expect(result.timedOut).toBe(false);
   });
 });
