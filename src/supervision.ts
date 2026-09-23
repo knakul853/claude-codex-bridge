@@ -9,6 +9,7 @@ import {
   type ProcessRunner,
 } from "./process";
 import { type ClaudeSession, listClaudeSessions } from "./sessions";
+import { handedOverSessions } from "./state";
 
 /** Native states that mean the session's own work has ended. */
 export const SETTLED_STATES = ["done", "stopped", "failed"];
@@ -129,20 +130,36 @@ interface SessionSources {
   record?: ClaudeSession;
   worker?: ProcessFacts;
   supervisor?: ProcessFacts;
+  /** The bridge delivered this session's handover to its owner. */
+  handedOver?: boolean;
+}
+
+/**
+ * Whether the worker's own work is over on evidence the native label cannot
+ * contradict: the bridge delivered its handover, and the registry does not
+ * report it back in a turn. Both are required — a delivered handover from an
+ * earlier turn says nothing about a worker that was continued since.
+ */
+function completedOf(input: SessionSources): boolean {
+  return input.handedOver === true && input.record?.status !== "busy";
 }
 
 function dispositionOf(
   input: SessionSources,
   settled: boolean,
+  completed: boolean,
 ): SessionDisposition {
   const { agent, record, worker } = input;
   if (!worker) {
     // No process to reclaim. An unsettled lease still counts as working: the
     // daemon can put this session back on the tree at any time.
     if (!agent) return "gone";
-    return settled ? "finished" : "working";
+    return settled || completed ? "finished" : "working";
   }
-  if (agent?.state === "blocked") return "stuck";
+  // A worker parked on a stale "blocked" label after it handed over is memory
+  // to reclaim; one that never handed over is a permission wait, which is the
+  // operator's to answer and never the bridge's to resume past.
+  if (agent?.state === "blocked") return completed ? "finished" : "stuck";
   // A native label written before the worker went back to work is stale; the
   // registry's own status outranks it.
   return settled && record?.status !== "busy" ? "finished" : "working";
@@ -152,9 +169,10 @@ function reconcile(input: SessionSources): SessionFacts {
   const { agent, worker } = input;
   const state = agent?.state;
   const settled = state !== undefined && SETTLED_STATES.includes(state);
-  const revivable = state !== undefined && !settled;
   const verified = worker !== undefined && CLAUDE_COMMAND.test(worker.command);
-  const disposition = dispositionOf(input, settled);
+  const disposition = dispositionOf(input, settled, completedOf(input));
+  const revivable =
+    state !== undefined && !settled && disposition !== "finished";
   return {
     sessionId: input.sessionId,
     disposition,
@@ -178,6 +196,8 @@ export interface ReconcileInput {
   agents: AgentRecord[];
   runner?: ProcessRunner;
   sessionsRoot?: string;
+  /** Sessions whose handover the bridge recorded as delivered to its owner. */
+  handedOver?: ReadonlySet<string>;
 }
 
 /**
@@ -220,6 +240,7 @@ export async function reconcileSessions(
         ...(record ? { record } : {}),
         ...(worker ? { worker } : {}),
         ...(supervisor ? { supervisor } : {}),
+        ...(input.handedOver?.has(sessionId) ? { handedOver: true } : {}),
       }),
     );
   }
@@ -251,6 +272,12 @@ export async function worktreeOwner(input: {
   const facts = await reconcileSessions({
     sessionIds: peers.map((peer) => peer.claudeSessionId as string),
     agents: input.agents,
+    handedOver: await handedOverSessions(
+      peers.map((peer) => ({
+        ...(peer.gitCommonDir ? { gitCommonDir: peer.gitCommonDir } : {}),
+        ...(peer.claudeSessionId ? { sessionId: peer.claudeSessionId } : {}),
+      })),
+    ),
     ...(input.runner ? { runner: input.runner } : {}),
     ...(input.sessionsRoot ? { sessionsRoot: input.sessionsRoot } : {}),
   });

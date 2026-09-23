@@ -5,7 +5,12 @@ import { continueJob, forgetJob, jobStatus, startJob } from "../src/claude";
 import { BridgeError } from "../src/errors";
 import { linkPeer, listPeers } from "../src/peers";
 import { NativeCommandError, type ProcessRunner } from "../src/process";
-import { loadManifest, writeManifest } from "../src/state";
+import {
+  claimDelivery,
+  loadManifest,
+  settleDelivery,
+  writeManifest,
+} from "../src/state";
 
 const roots: string[] = [];
 const sessionId = "44444444-4444-4444-8444-444444444444";
@@ -858,6 +863,34 @@ test("refuses a session whose live process is waiting for a permission decision"
     recorder.calls.some((argv) => argv[0] === "claude" && argv[1] === "stop"),
   ).toBe(false);
   expect(recorder.calls.some((argv) => argv[1] === "--resume")).toBe(false);
+});
+
+// The same "blocked" label over a worker that already delivered its handover is
+// a finished collaboration, which continue may reuse.
+test("continues a blocked session whose handover was delivered", async () => {
+  const repo = await continuable("bridge-continue-delivered");
+  const eventId = "b".repeat(64);
+  await claimDelivery(repo.commonDir, eventId, sessionId);
+  await settleDelivery(repo.commonDir, eventId, sessionId, "delivered");
+  const recorder = staleRunner({
+    sessionId,
+    shortId: "44444444",
+    cwd: repo.root,
+    commonDir: repo.commonDir,
+    state: "blocked",
+    pid: 4242,
+  });
+
+  const result = await continueJob({
+    sessionId,
+    prompt: "address the owner feedback",
+    gitCommonDir: repo.commonDir,
+    process: recorder.process,
+    home: repo.home,
+  });
+
+  expect(result.manifest.sessionId).toBe(sessionId);
+  expect(recorder.calls.some((argv) => argv[1] === "--resume")).toBe(true);
 });
 
 test("refuses to resume when the background lease will not settle", async () => {

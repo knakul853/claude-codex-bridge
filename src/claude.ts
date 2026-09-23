@@ -19,6 +19,7 @@ import {
 } from "./settings";
 import {
   forgetState,
+  handedOverSessions,
   loadManifest,
   saveManifest,
   writeManifest,
@@ -417,12 +418,14 @@ async function sessionFacts(
   sessionId: string,
   agents: AgentRecord[],
   process: ProcessRunner,
+  gitCommonDir: string,
 ): Promise<SessionFacts> {
   const facts = (
     await reconcileSessions({
       sessionIds: [sessionId],
       agents,
       runner: process,
+      handedOver: await handedOverSessions([{ gitCommonDir, sessionId }]),
     })
   ).get(sessionId);
   return (
@@ -463,7 +466,10 @@ export async function continueJob(input: {
     );
   }
   // The native state is the last label the daemon wrote, not a live condition.
-  requireNothingWriting(await sessionFacts(id, agents, process), agent.id);
+  requireNothingWriting(
+    await sessionFacts(id, agents, process, manifest.gitCommonDir),
+    agent.id,
+  );
   await requireRepositoryBinding(process, agent.cwd, manifest.gitCommonDir);
   const reservation = await reserveWorktree({
     cwd: agent.cwd,
@@ -482,10 +488,16 @@ export async function continueJob(input: {
  */
 async function settleForResume(input: {
   sessionId: string;
+  gitCommonDir: string;
   process: ProcessRunner;
 }): Promise<{ agents: AgentRecord[]; actions: string[] }> {
   const agents = await inventory(input.process);
-  const facts = await sessionFacts(input.sessionId, agents, input.process);
+  const facts = await sessionFacts(
+    input.sessionId,
+    agents,
+    input.process,
+    input.gitCommonDir,
+  );
   requireNothingWriting(facts, facts.shortId);
   if (!facts.revivable) return { agents, actions: [] };
   const outcome = await stopSession({
@@ -521,7 +533,11 @@ async function resumeWorker(
     // Re-read under the reservation: anything still writing in this tree — a
     // contender that published while we queued, or this session under a state
     // label written before it went back to work — has to be settled first.
-    const settled = await settleForResume({ sessionId: id, process });
+    const settled = await settleForResume({
+      sessionId: id,
+      gitCommonDir: manifest.gitCommonDir,
+      process,
+    });
     actions.push(...settled.actions);
     await requireFreeWorktree(agent.cwd, settled.agents, process, input.home);
     const launch = await process.run(
@@ -674,7 +690,14 @@ export async function jobStatus(input: {
   const runner = input.process ?? nativeProcessRunner;
   const all = await inventory(runner);
   const facts = (
-    await reconcileSessions({ sessionIds: [id], agents: all, runner })
+    await reconcileSessions({
+      sessionIds: [id],
+      agents: all,
+      runner,
+      handedOver: await handedOverSessions([
+        { gitCommonDir: input.gitCommonDir, sessionId: id },
+      ]),
+    })
   ).get(id);
   return {
     manifest,
@@ -707,7 +730,14 @@ export async function forgetJob(input: {
   const agent = matches[0];
   if (agent) {
     const facts = (
-      await reconcileSessions({ sessionIds: [id], agents, runner: process })
+      await reconcileSessions({
+        sessionIds: [id],
+        agents,
+        runner: process,
+        handedOver: await handedOverSessions([
+          { gitCommonDir: input.gitCommonDir, sessionId: id },
+        ]),
+      })
     ).get(id);
     if (facts && isActive(facts)) {
       throw new Error("forget refuses a live or blocked session");

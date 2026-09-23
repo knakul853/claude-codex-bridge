@@ -78,6 +78,58 @@ export async function loadManifest(
   }
 }
 
+/**
+ * The sessions whose handover this repository has on record as delivered to the
+ * owner. It is the one durable fact that a worker's own work ended: the native
+ * state label outlives the turn it describes, and a delivery is only written
+ * after the owner's thread took the message.
+ */
+export async function deliveredSessions(
+  gitCommonDir: string,
+): Promise<Set<string>> {
+  const deliveries = join(stateRoot(gitCommonDir), "deliveries");
+  const glob = new Bun.Glob("*.json");
+  const sessions = new Set<string>();
+  try {
+    for await (const name of glob.scan({ cwd: deliveries, onlyFiles: true })) {
+      const path = join(deliveries, name);
+      try {
+        const record = parseDeliveryRecord(JSON.parse(await safeRead(path)));
+        if (record.status === "delivered") sessions.add(record.sessionId);
+      } catch {
+        // A record being rewritten must not hide the others.
+      }
+    }
+  } catch (error) {
+    if (!absent(error)) throw error;
+  }
+  return sessions;
+}
+
+/**
+ * Which of the named workers have delivered a handover, reading each repository
+ * once. A worker whose link never recorded its repository is left out rather
+ * than guessed at.
+ */
+export async function handedOverSessions(
+  workers: Array<{ gitCommonDir?: string; sessionId?: string }>,
+): Promise<Set<string>> {
+  const byRepository = new Map<string, Set<string>>();
+  for (const worker of workers) {
+    if (!worker.gitCommonDir || !worker.sessionId) continue;
+    const wanted = byRepository.get(worker.gitCommonDir) ?? new Set<string>([]);
+    wanted.add(worker.sessionId);
+    byRepository.set(worker.gitCommonDir, wanted);
+  }
+  const handedOver = new Set<string>();
+  for (const [gitCommonDir, wanted] of byRepository) {
+    for (const sessionId of await deliveredSessions(gitCommonDir)) {
+      if (wanted.has(sessionId)) handedOver.add(sessionId);
+    }
+  }
+  return handedOver;
+}
+
 export async function forgetState(
   gitCommonDir: string,
   sessionId: string,

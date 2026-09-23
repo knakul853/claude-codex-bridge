@@ -5,7 +5,7 @@ import type { PeerLink } from "./contracts";
 import { BridgeError, errorMessage } from "./errors";
 import { findPeer, listPeers, unlinkPeer } from "./peers";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
-import { forgetState } from "./state";
+import { forgetState, handedOverSessions } from "./state";
 import {
   isActive,
   reconcileSessions,
@@ -53,6 +53,12 @@ export async function surveyPeers(
     ),
     agents,
     runner: process,
+    handedOver: await handedOverSessions(
+      peers.map((peer) => ({
+        ...(peer.gitCommonDir ? { gitCommonDir: peer.gitCommonDir } : {}),
+        ...(peer.claudeSessionId ? { sessionId: peer.claudeSessionId } : {}),
+      })),
+    ),
   });
   return peers.map((peer) => {
     const session = peer.claudeSessionId
