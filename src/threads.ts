@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -47,11 +47,32 @@ export function defaultCodexHome(): string {
   return process.env.CODEX_HOME ?? join(homedir(), ".codex");
 }
 
+/**
+ * The desktop app keeps its state database in WAL mode and deletes the -shm
+ * file when it closes it. SQLite cannot open such a file read-only, since that
+ * needs to create -shm, so it is opened immutable instead: nothing is writing
+ * it, and the bridge only reads.
+ */
+function openStateDatabase(path: string): Database {
+  const db = new Database(path, { readonly: true });
+  try {
+    db.query("select 1").get();
+    return db;
+  } catch (error) {
+    db.close();
+    const code = (error as { code?: unknown }).code;
+    if (code !== "SQLITE_CANTOPEN" || existsSync(`${path}-shm`)) throw error;
+    return new Database(`file:${encodeURI(path)}?immutable=1`, {
+      readonly: true,
+    });
+  }
+}
+
 export class SqliteThreadStore implements ThreadStore {
   private readonly db: Database;
 
   constructor(databasePath: string) {
-    this.db = new Database(databasePath, { readonly: true });
+    this.db = openStateDatabase(databasePath);
   }
 
   static open(codexHome = defaultCodexHome()): SqliteThreadStore {

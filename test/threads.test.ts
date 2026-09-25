@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, rmSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -184,5 +185,25 @@ describe("thread selection", () => {
       "aurora-nuclei",
     ]);
     expect(projects.every((p) => p.roots.includes("/repo/shared"))).toBe(true);
+  });
+});
+
+describe("a state database the desktop app has closed", () => {
+  test("is still readable after the app checkpointed and removed its WAL files", async () => {
+    const home = await stateDatabase([
+      { id: "t1", title: "Plan QA", cwd: "/repo/a", updated: 10 },
+    ]);
+    const path = join(home, "state_5.sqlite");
+    const writer = new Database(path);
+    writer.run("PRAGMA journal_mode=WAL");
+    writer.run("PRAGMA wal_checkpoint(TRUNCATE)");
+    writer.close();
+    for (const suffix of ["-shm", "-wal"])
+      rmSync(`${path}${suffix}`, { force: true });
+
+    const [thread] = SqliteThreadStore.open(home).threads();
+
+    expect(thread?.id).toBe("t1");
+    expect(existsSync(`${path}-shm`)).toBe(false);
   });
 });
