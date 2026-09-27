@@ -7,6 +7,7 @@ import {
   parseHandover,
   parseSessionId,
 } from "./contracts";
+import { listPeers } from "./peers";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
 import { type RepositoryState, readRepositoryState } from "./repository";
 import { redactText, truncateText } from "./safety";
@@ -31,6 +32,10 @@ export interface HookDependencies {
     commonDir: string,
     sessionId: string,
   ): Promise<BridgeManifest | undefined>;
+  currentSession(
+    cwd: string,
+    manifest: BridgeManifest,
+  ): Promise<string | undefined>;
   claimDelivery(
     commonDir: string,
     eventId: string,
@@ -226,6 +231,10 @@ export async function handleHook(
   ) {
     throw new Error("hook identity does not match the recorded manifest");
   }
+  const currentSession = await deps.currentSession(git.root, manifest);
+  if (currentSession && currentSession !== input.session_id) {
+    return { kind: "allow" };
+  }
   const sessionId = input.session_id;
   if (input.hook_event_name === "StopFailure") {
     const runtimeFailure = input.error ?? "Runtime failure without detail.";
@@ -292,6 +301,16 @@ export async function runHook(
   return handleHook(input, {
     gitState: (cwd) => readRepositoryState(cwd, process),
     loadManifest,
+    currentSession: async (cwd, manifest) => {
+      const matches = (await listPeers()).filter(
+        (peer) =>
+          peer.claudeSessionId !== undefined &&
+          peer.codexThreadId === manifest.ownerThreadId &&
+          peer.gitCommonDir === manifest.gitCommonDir &&
+          samePath(peer.cwd, cwd),
+      );
+      return matches.length === 1 ? matches[0]?.claudeSessionId : undefined;
+    },
     claimDelivery,
     settleDelivery,
     queue: async (threadId, message) => {

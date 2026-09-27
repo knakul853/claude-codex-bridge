@@ -30,6 +30,7 @@ function dependencies(overrides: Partial<HookDependencies> = {}): {
         changedFiles: ["src/fix.ts"],
       }),
       loadManifest: async () => manifest,
+      currentSession: async () => sessionId,
       claimDelivery: async (_common, eventId) => {
         if (claimed.has(eventId)) return false;
         claimed.add(eventId);
@@ -117,6 +118,14 @@ test("ignores unrelated native Claude sessions", async () => {
       deps,
     ),
   ).toEqual({ kind: "allow" });
+  expect(queued).toHaveLength(0);
+});
+
+test("ignores a handover from the session its peer has superseded", async () => {
+  const { deps, queued } = dependencies({
+    currentSession: async () => "66666666-6666-4666-8666-666666666666",
+  });
+  expect(await handleHook(stop(handover), deps)).toEqual({ kind: "allow" });
   expect(queued).toHaveLength(0);
 });
 
