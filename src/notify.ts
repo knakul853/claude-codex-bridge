@@ -13,6 +13,10 @@ export interface NotifyInput {
   to?: string;
   /** Resolve the addressee by the directory it is working in. */
   cwd?: string;
+  /** Resolve the addressee by its human-visible Claude session title. */
+  title?: string;
+  /** Resolve the exact live Claude process. */
+  pid?: number;
   from: string;
   message: string;
   /** Also interrupt the live session over its socket, not just queue the lane. */
@@ -27,6 +31,8 @@ export interface NotifyResult {
   /** Whether the message was recorded on the lane. */
   queued: boolean;
   sessionId?: string;
+  pid?: number;
+  title?: string;
   /**
    * Whether the socket took the nudge — not a delivery receipt. The addressee
    * holds a message attesting no permission mode while it bypasses prompts,
@@ -39,17 +45,20 @@ export interface NotifyResult {
 async function resolveTarget(
   input: NotifyInput,
 ): Promise<ClaudeSession | undefined> {
-  if (!input.to && !input.cwd) return undefined;
+  if (!input.to && !input.cwd && !input.title && input.pid === undefined)
+    return undefined;
   const matches = await findClaudeSessions(
     {
       ...(input.to ? { session: input.to } : {}),
       ...(input.cwd ? { cwd: input.cwd } : {}),
+      ...(input.title ? { title: input.title } : {}),
+      ...(input.pid !== undefined ? { pid: input.pid } : {}),
     },
     input.sessionsRoot,
   );
   if (matches.length > 1) {
     throw new Error(
-      `${matches.length} live Claude sessions match; address one with --to <session-id>`,
+      `${matches.length} live Claude sessions match; address one with --to <session-id> or --pid <pid>`,
     );
   }
   return matches[0];
@@ -93,6 +102,8 @@ export async function notifyClaude(input: NotifyInput): Promise<NotifyResult> {
     lane,
     queued,
     ...(addressee ? { sessionId: addressee } : {}),
+    ...(target ? { pid: target.pid } : {}),
+    ...(target?.title ? { title: target.title } : {}),
   };
   // Push on request, and also whenever the lane failed: it is then the only
   // channel left rather than a nudge.

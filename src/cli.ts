@@ -71,8 +71,9 @@ Codex desktop app (has computer use and your browser sessions):
                                              assistant turn; exit 3 on timeout
 
 Messages from Codex to a Claude session:
-  sessions [--cwd PATH]                      live Claude sessions, with ids
+  sessions [--cwd PATH]                      live Claude sessions, with titles
   notify --message TEXT [--to SESSION]       queue on that session's lane
+      [--title TITLE] [--pid PID]            address by title or exact process
       [--cwd PATH] [--from NAME]             address by directory instead of id
       [--push]                               also interrupt it over its socket
   inbox [--watch] [--to SESSION]             read this session's lane, or block
@@ -214,9 +215,16 @@ async function main(): Promise<void> {
   if (command === "notify") {
     const to = option("--to");
     const cwd = option("--cwd");
+    const title = option("--title");
+    const pidText = option("--pid");
+    const pid = pidText === undefined ? undefined : Number(pidText);
+    if (pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0))
+      throw new Error("--pid must be a positive integer");
     const result = await notifyClaude({
       ...(to ? { to } : {}),
       ...(cwd ? { cwd } : {}),
+      ...(title ? { title } : {}),
+      ...(pid !== undefined ? { pid } : {}),
       from: option("--from") ?? "codex",
       message: option("--message") ?? (await prompt()),
       push: flag("--push"),

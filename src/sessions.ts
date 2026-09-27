@@ -1,5 +1,5 @@
 import { readdirSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
 import { connect } from "node:net";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -15,7 +15,9 @@ export interface ClaudeSession {
   cwd: string;
   kind: string;
   name?: string;
+  title?: string;
   status?: string;
+  startedAt?: number;
   procStart?: string;
   messagingSocketPath?: string;
 }
@@ -23,6 +25,12 @@ export interface ClaudeSession {
 export function sessionsRoot(): string {
   return (
     process.env.CLAUDE_SESSIONS_DIR ?? join(homedir(), ".claude", "sessions")
+  );
+}
+
+export function projectsRoot(): string {
+  return (
+    process.env.CLAUDE_PROJECTS_DIR ?? join(homedir(), ".claude", "projects")
   );
 }
 
@@ -47,7 +55,11 @@ function parseSession(value: unknown): ClaudeSession | undefined {
     cwd: record.cwd,
     kind: typeof record.kind === "string" ? record.kind : "unknown",
     ...(typeof record.name === "string" ? { name: record.name } : {}),
+    ...(typeof record.title === "string" ? { title: record.title } : {}),
     ...(typeof record.status === "string" ? { status: record.status } : {}),
+    ...(Number.isSafeInteger(record.startedAt)
+      ? { startedAt: record.startedAt as number }
+      : {}),
     ...(typeof record.procStart === "string"
       ? { procStart: record.procStart }
       : {}),
@@ -57,8 +69,64 @@ function parseSession(value: unknown): ClaudeSession | undefined {
   };
 }
 
+function projectDirectory(cwd: string, root: string): string {
+  return join(root, cwd.replace(/[^A-Za-z0-9]/g, "-"));
+}
+
+async function sessionTitle(
+  session: ClaudeSession,
+  root: string,
+): Promise<string | undefined> {
+  const path = join(
+    projectDirectory(session.cwd, root),
+    `${session.sessionId}.jsonl`,
+  );
+  let file: Awaited<ReturnType<typeof open>>;
+  try {
+    file = await open(path, "r");
+  } catch {
+    return;
+  }
+  try {
+    const { size } = await file.stat();
+    const length = Math.min(size, 256 * 1024);
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await file.read(buffer, 0, length, size - length);
+    let generated: string | undefined;
+    for (const line of buffer
+      .subarray(0, bytesRead)
+      .toString("utf8")
+      .split("\n")
+      .reverse()) {
+      if (!line.trim()) continue;
+      try {
+        const record = JSON.parse(line) as Record<string, unknown>;
+        if (
+          record.type === "custom-title" &&
+          typeof record.customTitle === "string"
+        ) {
+          return record.customTitle;
+        }
+        if (
+          generated === undefined &&
+          record.type === "ai-title" &&
+          typeof record.aiTitle === "string"
+        ) {
+          generated = record.aiTitle;
+        }
+      } catch {
+        // The first line may begin before the tail window.
+      }
+    }
+    return generated;
+  } finally {
+    await file.close();
+  }
+}
+
 export async function listClaudeSessions(
   root = sessionsRoot(),
+  transcriptRoot = projectsRoot(),
 ): Promise<ClaudeSession[]> {
   let names: string[];
   try {
@@ -72,7 +140,11 @@ export async function listClaudeSessions(
       const parsed = parseSession(
         JSON.parse(await readFile(join(root, name), "utf8")),
       );
-      if (parsed) sessions.push(parsed);
+      if (parsed) {
+        const title =
+          parsed.title ?? (await sessionTitle(parsed, transcriptRoot));
+        sessions.push({ ...parsed, ...(title ? { title } : {}) });
+      }
     } catch {
       // A record being rewritten must not hide the others.
     }
@@ -84,6 +156,8 @@ export interface SessionQuery {
   session?: string;
   cwd?: string;
   name?: string;
+  title?: string;
+  pid?: number;
 }
 
 /**
@@ -93,15 +167,31 @@ export interface SessionQuery {
 export async function findClaudeSessions(
   query: SessionQuery,
   root?: string,
+  transcriptRoot?: string,
 ): Promise<ClaudeSession[]> {
-  const sessions = await listClaudeSessions(root);
+  const sessions = await listClaudeSessions(root, transcriptRoot);
   const wantedCwd = query.cwd ? resolve(query.cwd) : undefined;
-  return sessions.filter(
+  const wantedTitle = query.title?.trim().toLocaleLowerCase();
+  const matches = sessions.filter(
     (session) =>
       (query.session === undefined || session.sessionId === query.session) &&
       (wantedCwd === undefined || resolve(session.cwd) === wantedCwd) &&
-      (query.name === undefined || session.name === query.name),
+      (query.name === undefined || session.name === query.name) &&
+      (wantedTitle === undefined ||
+        session.title?.trim().toLocaleLowerCase() === wantedTitle) &&
+      (query.pid === undefined || session.pid === query.pid),
   );
+  const newest = new Map<string, ClaudeSession>();
+  for (const session of matches) {
+    const current = newest.get(session.sessionId);
+    if (
+      !current ||
+      (session.startedAt ?? session.pid) > (current.startedAt ?? current.pid)
+    ) {
+      newest.set(session.sessionId, session);
+    }
+  }
+  return [...newest.values()];
 }
 
 interface PeerKey {

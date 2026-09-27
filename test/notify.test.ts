@@ -133,6 +133,57 @@ describe("notifyClaude", () => {
     expect(result.lane).toBe(join(home, "inbox", `${sessionB}.jsonl`));
   });
 
+  test("resolves a human title and reports the selected process", async () => {
+    const home = await temporary("bridge-notify-home-");
+    const sessionsRoot = await registry([
+      {
+        pid: 101,
+        sessionId: sessionA,
+        cwd: "/repo/aurora",
+        kind: "interactive",
+        title: "QA agent implementation",
+      },
+    ]);
+    const result = await notifyClaude({
+      title: "qa AGENT implementation",
+      from: "codex",
+      message: "hello",
+      home,
+      sessionsRoot,
+    });
+    expect(result.sessionId).toBe(sessionA);
+    expect(result.pid).toBe(101);
+    expect(result.title).toBe("QA agent implementation");
+  });
+
+  test("refuses a title shared by different logical sessions", async () => {
+    const sessionsRoot = await registry([
+      {
+        pid: 101,
+        sessionId: sessionA,
+        cwd: "/repo/a",
+        kind: "interactive",
+        title: "QA agent implementation",
+      },
+      {
+        pid: 102,
+        sessionId: sessionB,
+        cwd: "/repo/b",
+        kind: "interactive",
+        title: "QA agent implementation",
+      },
+    ]);
+    await expect(
+      notifyClaude({
+        title: "QA agent implementation",
+        from: "codex",
+        message: "which one",
+        home: await temporary("bridge-notify-home-"),
+        sessionsRoot,
+      }),
+    ).rejects.toThrow(/--pid/);
+  });
+
   test("refuses to guess when a directory has two sessions in it", async () => {
     const sessionsRoot = await registry([
       { pid: 101, sessionId: sessionA, cwd: "/repo/a", kind: "interactive" },

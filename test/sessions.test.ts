@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -110,6 +110,54 @@ describe("claude session discovery", () => {
       { pid: 102, sessionId: sessionB, cwd: "/repo/a", kind: "background" },
     ]);
     expect(await findClaudeSessions({ cwd: "/repo/a" }, root)).toHaveLength(2);
+  });
+
+  test("finds a session by its human title", async () => {
+    const root = await registry([
+      {
+        pid: 101,
+        sessionId: sessionA,
+        cwd: "/repo/aurora",
+        kind: "interactive",
+      },
+    ]);
+    const projects = await mkdtemp(join(tmpdir(), "bridge-projects-"));
+    roots.push(projects);
+    const project = join(projects, "-repo-aurora");
+    await mkdir(project);
+    await writeFile(
+      join(project, `${sessionA}.jsonl`),
+      `${JSON.stringify({ type: "ai-title", aiTitle: "QA agent implementation" })}\n`,
+      "utf8",
+    );
+    const found = await findClaudeSessions(
+      { title: "qa AGENT implementation" },
+      root,
+      projects,
+    );
+    expect(found).toHaveLength(1);
+    expect(found[0]?.title).toBe("QA agent implementation");
+  });
+
+  test("uses the newest process when one Claude session was resumed twice", async () => {
+    const root = await registry([
+      {
+        pid: 101,
+        sessionId: sessionA,
+        cwd: "/repo/a",
+        kind: "interactive",
+        startedAt: 100,
+      },
+      {
+        pid: 202,
+        sessionId: sessionA,
+        cwd: "/repo/a",
+        kind: "interactive",
+        startedAt: 200,
+      },
+    ]);
+    const found = await findClaudeSessions({ session: sessionA }, root);
+    expect(found.map((session) => session.pid)).toEqual([202]);
   });
 });
 
