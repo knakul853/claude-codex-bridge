@@ -1,10 +1,16 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, rmSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { newestStateDatabase, SqliteThreadStore } from "../src/threads";
+import {
+  type CodexThread,
+  newestStateDatabase,
+  SqliteThreadStore,
+  searchRollout,
+  searchThreads,
+} from "../src/threads";
 
 const roots: string[] = [];
 
@@ -205,5 +211,116 @@ describe("a state database the desktop app has closed", () => {
 
     expect(thread?.id).toBe("t1");
     expect(existsSync(`${path}-shm`)).toBe(false);
+  });
+});
+
+describe("title search", () => {
+  test("matches name, title or first prompt, ignoring case", async () => {
+    const home = await stateDatabase([
+      {
+        id: "named",
+        name: "Observability and Monitoring",
+        cwd: "/r",
+        updated: 3,
+      },
+      { id: "titled", title: "review MONITORING gaps", cwd: "/r", updated: 2 },
+      {
+        id: "prompted",
+        first: "set up monitoring for x",
+        cwd: "/r",
+        updated: 1,
+      },
+      { id: "other", name: "fix login", cwd: "/r", updated: 4 },
+    ]);
+    expect(
+      SqliteThreadStore.open(home)
+        .threads({ titleContains: "monitoring" })
+        .map((t) => t.id),
+    ).toEqual(["named", "titled", "prompted"]);
+  });
+
+  test("treats % and _ as literal characters", async () => {
+    const home = await stateDatabase([
+      { id: "pct", name: "cut cost 50%", cwd: "/r", updated: 2 },
+      { id: "plain", name: "cut cost 500", cwd: "/r", updated: 1 },
+    ]);
+    expect(
+      SqliteThreadStore.open(home)
+        .threads({ titleContains: "50%" })
+        .map((t) => t.id),
+    ).toEqual(["pct"]);
+  });
+});
+
+function message(role: string, text: string): string {
+  return JSON.stringify({
+    type: "response_item",
+    payload: {
+      type: "message",
+      role,
+      content: [{ type: "output_text", text }],
+    },
+  });
+}
+
+async function rollout(lines: string[]): Promise<string> {
+  const home = await mkdtemp(join(tmpdir(), "bridge-rollout-"));
+  roots.push(home);
+  const path = join(home, "rollout.jsonl");
+  await writeFile(path, `${lines.join("\n")}\n`);
+  return path;
+}
+
+describe("content search", () => {
+  test("counts user and assistant messages, not tool output", async () => {
+    const path = await rollout([
+      message("user", "please review the Grafana dashboard"),
+      JSON.stringify({
+        type: "response_item",
+        payload: { type: "function_call_output", output: "grafana grafana" },
+      }),
+      message("assistant", "The grafana panel titles are unclear."),
+      message("assistant", "unrelated reply"),
+    ]);
+    const result = await searchRollout(path, "GRAFANA");
+    expect(result.count).toBe(2);
+    expect(result.matches.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(result.matches[1]?.snippet).toContain("grafana panel");
+  });
+
+  test("keeps only the first matches but counts them all", async () => {
+    const path = await rollout(
+      Array.from({ length: 5 }, (_, i) => message("assistant", `alert ${i}`)),
+    );
+    const result = await searchRollout(path, "alert", 2);
+    expect(result.count).toBe(5);
+    expect(result.matches).toHaveLength(2);
+  });
+
+  test("returns threads matching by title or content, newest first", async () => {
+    const withContent = await rollout([message("assistant", "SLO burn rate")]);
+    const thread = (
+      id: string,
+      label: string,
+      rolloutPath: string | null,
+    ): CodexThread => ({
+      id,
+      label,
+      cwd: "/r",
+      updatedAtMs: 0,
+      rolloutPath,
+    });
+    const hits = await searchThreads(
+      [
+        thread("by-content", "misc", withContent),
+        thread("by-title", "SLO design", null),
+        thread("neither", "misc", withContent.replace("rollout", "missing")),
+      ],
+      "slo",
+    );
+    expect(hits.map((h) => [h.id, h.titleMatch, h.messageMatches])).toEqual([
+      ["by-content", false, 1],
+      ["by-title", true, 0],
+    ]);
   });
 });

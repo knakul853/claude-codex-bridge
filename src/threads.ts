@@ -23,9 +23,16 @@ export interface CodexThread {
   rolloutPath: string | null;
 }
 
+export interface ThreadQuery {
+  roots?: string[];
+  limit?: number;
+  /** Case-insensitive substring of the thread's name, title or first prompt. */
+  titleContains?: string;
+}
+
 export interface ThreadStore {
   projects(): CodexProject[];
-  threads(options?: { roots?: string[]; limit?: number }): CodexThread[];
+  threads(options?: ThreadQuery): CodexThread[];
 }
 
 // Codex bumps the state file name on schema migrations (state_4, state_5, ...).
@@ -103,12 +110,20 @@ export class SqliteThreadStore implements ThreadStore {
 
   // Threads carry no project_id in the local store, so a project's threads are
   // the ones whose cwd is one of its roots.
-  threads(options: { roots?: string[]; limit?: number } = {}): CodexThread[] {
+  threads(options: ThreadQuery = {}): CodexThread[] {
     const limit = options.limit ?? 20;
     const roots = options.roots;
     const where = ["coalesce(archived, 0) = 0"];
+    const params: string[] = [];
     if (roots?.length) {
       where.push(`cwd in (${roots.map(() => "?").join(", ")})`);
+      params.push(...roots);
+    }
+    if (options.titleContains) {
+      where.push(
+        `lower(coalesce(name, '') || ' ' || coalesce(title, '') || ' ' || coalesce(first_user_message, '')) like ? escape '\\'`,
+      );
+      params.push(`%${escapeLike(options.titleContains.toLowerCase())}%`);
     }
     return this.db
       .query<
@@ -132,7 +147,7 @@ export class SqliteThreadStore implements ThreadStore {
           where ${where.join(" and ")}
           order by updated_at_ms desc
           limit ${limit}`)
-      .all(...(roots ?? []))
+      .all(...params)
       .map((row) => ({
         id: row.id,
         label: row.label,
@@ -141,6 +156,10 @@ export class SqliteThreadStore implements ThreadStore {
         rolloutPath: row.rollout_path,
       }));
   }
+}
+
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
 }
 
 export function resolveProject(
@@ -201,33 +220,129 @@ export async function scanAssistantMessages(
   }
 }
 
+interface ConversationMessage {
+  role: "user" | "assistant";
+  text: string;
+}
+
+function parseConversationMessage(line: string): ConversationMessage | null {
+  let event: Record<string, unknown>;
+  try {
+    event = JSON.parse(line) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (event.type !== "response_item") return null;
+  const payload = event.payload as Record<string, unknown> | undefined;
+  if (!payload || payload.type !== "message") return null;
+  if (payload.role !== "assistant" && payload.role !== "user") return null;
+  const content = Array.isArray(payload.content) ? payload.content : [];
+  const text = content
+    .map((part) =>
+      typeof part === "object" && part && "text" in part
+        ? String((part as { text?: unknown }).text ?? "")
+        : "",
+    )
+    .join("")
+    .trim();
+  return text ? { role: payload.role, text } : null;
+}
+
 export function parseAssistantMessages(text: string): AssistantMessage[] {
   const messages: AssistantMessage[] = [];
   let index = 0;
   for (const line of text.split("\n")) {
     index += 1;
-    let event: Record<string, unknown>;
-    try {
-      event = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    if (event.type !== "response_item") continue;
-    const payload = event.payload as Record<string, unknown> | undefined;
-    if (!payload || payload.type !== "message" || payload.role !== "assistant")
-      continue;
-    const content = Array.isArray(payload.content) ? payload.content : [];
-    const body = content
-      .map((part) =>
-        typeof part === "object" && part && "text" in part
-          ? String((part as { text?: unknown }).text ?? "")
-          : "",
-      )
-      .join("")
-      .trim();
-    if (body) messages.push({ text: body, index });
+    const message = parseConversationMessage(line);
+    if (message?.role === "assistant")
+      messages.push({ text: message.text, index });
   }
   return messages;
+}
+
+export interface ContentMatch {
+  role: "user" | "assistant";
+  snippet: string;
+}
+
+export interface ContentSearch {
+  count: number;
+  matches: ContentMatch[];
+}
+
+const SNIPPET_RADIUS = 80;
+
+function snippetAround(text: string, at: number, length: number): string {
+  const start = Math.max(0, at - SNIPPET_RADIUS);
+  const end = Math.min(text.length, at + length + SNIPPET_RADIUS);
+  const body = text.slice(start, end).replace(/\s+/g, " ").trim();
+  return `${start > 0 ? "…" : ""}${body}${end < text.length ? "…" : ""}`;
+}
+
+// Rollouts reach hundreds of megabytes, so they are streamed line by line, and a
+// line is parsed only when its raw bytes already contain the needle. Only user
+// and assistant messages count: tool output would match every command Codex ran.
+export async function searchRollout(
+  rolloutPath: string,
+  query: string,
+  maxMatches = 3,
+): Promise<ContentSearch> {
+  const needle = query.toLowerCase();
+  const result: ContentSearch = { count: 0, matches: [] };
+  const decoder = new TextDecoder();
+  let pending = "";
+  const consider = (line: string): void => {
+    if (!line.toLowerCase().includes(needle)) return;
+    const message = parseConversationMessage(line);
+    if (!message) return;
+    const at = message.text.toLowerCase().indexOf(needle);
+    if (at === -1) return;
+    result.count += 1;
+    if (result.matches.length < maxMatches) {
+      result.matches.push({
+        role: message.role,
+        snippet: snippetAround(message.text, at, needle.length),
+      });
+    }
+  };
+  for await (const chunk of Bun.file(rolloutPath).stream()) {
+    pending += decoder.decode(chunk, { stream: true });
+    const lines = pending.split("\n");
+    pending = lines.pop() ?? "";
+    for (const line of lines) consider(line);
+  }
+  consider(pending + decoder.decode());
+  return result;
+}
+
+export interface ThreadSearchHit extends CodexThread {
+  titleMatch: boolean;
+  messageMatches: number;
+  snippets: ContentMatch[];
+}
+
+/** Threads whose label or messages contain the query, newest first. */
+export async function searchThreads(
+  threads: CodexThread[],
+  query: string,
+): Promise<ThreadSearchHit[]> {
+  const needle = query.toLowerCase();
+  const hits: ThreadSearchHit[] = [];
+  for (const thread of threads) {
+    const titleMatch = thread.label.toLowerCase().includes(needle);
+    const content =
+      thread.rolloutPath && existsSync(thread.rolloutPath)
+        ? await searchRollout(thread.rolloutPath, query)
+        : { count: 0, matches: [] };
+    if (!titleMatch && content.count === 0) continue;
+    hits.push({
+      ...thread,
+      titleMatch,
+      messageMatches: content.count,
+      snippets: content.matches,
+    });
+  }
+  return hits;
 }
 
 export function rolloutSize(rolloutPath: string): number {

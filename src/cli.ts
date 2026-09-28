@@ -48,6 +48,7 @@ import {
   rolloutSize,
   SqliteThreadStore,
   scanAssistantMessages,
+  searchThreads,
 } from "./threads";
 
 const USAGE = `claude-codex-bridge <command>
@@ -55,6 +56,9 @@ const USAGE = `claude-codex-bridge <command>
 Codex desktop app (has computer use and your browser sessions):
   projects                                   list projects and their roots
   threads [--project N] [--limit N]          threads, newest first
+  search --query TEXT [--titles]             threads whose title, or with no
+      [--project N | --cwd PATH] [--limit N] --titles whose messages, contain TEXT;
+                                             scans the newest --limit (50)
   send --new --cwd PATH --message TEXT       open the app on that directory,
                                              prefill, press return, print the id
       [--project N]                          address by project instead of path
@@ -125,6 +129,13 @@ function required(name: string): string {
   const value = option(name);
   if (!value) throw new CliError(`${name} is required`, 2);
   return value;
+}
+
+function selectedRoots(store: SqliteThreadStore): string[] | undefined {
+  const cwd = option("--cwd");
+  if (cwd) return [resolve(cwd)];
+  const name = option("--project");
+  return name ? resolveProject(store.projects(), name).roots : undefined;
 }
 
 function emit(value: unknown): void {
@@ -307,15 +318,30 @@ async function main(): Promise<void> {
   }
   if (command === "threads") {
     const store = SqliteThreadStore.open();
-    const name = option("--project");
-    const cwd = option("--cwd");
-    const roots = cwd
-      ? [resolve(cwd)]
-      : name
-        ? resolveProject(store.projects(), name).roots
-        : undefined;
+    const roots = selectedRoots(store);
     const limit = Number(option("--limit") ?? 20);
     emit({ threads: store.threads({ ...(roots ? { roots } : {}), limit }) });
+    return;
+  }
+  if (command === "search") {
+    const store = SqliteThreadStore.open();
+    const query = required("--query");
+    const roots = selectedRoots(store);
+    const scope = roots ? { roots } : {};
+    if (flag("--titles")) {
+      const limit = Number(option("--limit") ?? 20);
+      emit({
+        query,
+        threads: store.threads({ ...scope, limit, titleContains: query }),
+      });
+      return;
+    }
+    const limit = Number(option("--limit") ?? 50);
+    emit({
+      query,
+      scanned: limit,
+      threads: await searchThreads(store.threads({ ...scope, limit }), query),
+    });
     return;
   }
   if (command === "read") {

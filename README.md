@@ -217,6 +217,8 @@ target it.
 ```bash
 claude-codex-bridge projects                          # projects and their root directories
 claude-codex-bridge threads --cwd /path/to/repo       # newest first
+claude-codex-bridge search --query "slo" --titles     # thread titles containing it
+claude-codex-bridge search --query "slo" --limit 50   # messages in the 50 newest threads
 claude-codex-bridge send --cwd /path/to/repo --new --message "..."
 claude-codex-bridge send --thread <uuid> --message "..." --wait
 claude-codex-bridge send --thread <uuid> --message "..." --steer   # into the running turn
