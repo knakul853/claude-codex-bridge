@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import type { BridgeManifest } from "../src/contracts";
 import { type HookDependencies, handleHook } from "../src/hook";
+import { NativeCommandError } from "../src/process";
+import { readRepositoryStateIfRepo } from "../src/repository";
 
 const sessionId = "55555555-5555-4555-8555-555555555555";
 const manifest: BridgeManifest = {
@@ -199,4 +201,50 @@ test("queues again when the handover or the Git head changes", async () => {
   head = "b".repeat(40);
   await handleHook(stop(`Done.\n\n${handover}`), deps);
   expect(queued).toHaveLength(3);
+});
+
+test("allows silently when the cwd is not inside a git repository", async () => {
+  const { deps, queued } = dependencies({ gitState: async () => undefined });
+  expect(
+    await handleHook(
+      { session_id: sessionId, cwd: "/tmp", hook_event_name: "Stop" },
+      deps,
+    ),
+  ).toEqual({ kind: "allow" });
+  expect(queued).toHaveLength(0);
+});
+
+test("allows silently when the session has no bridge manifest", async () => {
+  const { deps, queued } = dependencies({
+    loadManifest: async () => undefined,
+  });
+  expect(
+    await handleHook(
+      { session_id: sessionId, cwd: "/repo/example", hook_event_name: "Stop" },
+      deps,
+    ),
+  ).toEqual({ kind: "allow" });
+  expect(queued).toHaveLength(0);
+});
+
+test("only a not-a-repository failure is swallowed; other git failures stay loud", async () => {
+  const failing = (detail: string) => ({
+    run: async () => {
+      throw new NativeCommandError("git", 128, detail);
+    },
+  });
+  expect(
+    await readRepositoryStateIfRepo(
+      "/tmp",
+      failing(
+        "fatal: not a git repository (or any of the parent directories): .git",
+      ),
+    ),
+  ).toBeUndefined();
+  await expect(
+    readRepositoryStateIfRepo(
+      "/tmp",
+      failing("fatal: detected dubious ownership"),
+    ),
+  ).rejects.toThrow("dubious ownership");
 });
