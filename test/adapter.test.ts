@@ -313,12 +313,18 @@ describe("a fake adapter", () => {
         send: { argv: ["{bin}", "fail", "{session}", "{message}"] },
       }),
     );
+    const secret = "abcdefghijklmnop";
+    process.env.LEAKED_SUFFIX = secret;
     const error = await sendThroughAdapter(manifest, fake.binary, {
       session: "s",
       message: "m",
-    }).catch((e: Error) => e);
+    })
+      .catch((e: Error) => e)
+      .finally(() => {
+        delete process.env.LEAKED_SUFFIX;
+      });
     expect((error as Error).message).toContain("exited 3");
-    expect((error as Error).message).not.toContain("sk-abcdefghijklmnop");
+    expect((error as Error).message).not.toContain(secret);
   });
 
   test("a message starting with - is refused unless the template has --", async () => {

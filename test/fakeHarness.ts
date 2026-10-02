@@ -15,7 +15,7 @@ case "$1" in
     echo "replied"
     ;;
   fail)
-    echo "token=sk-abcdefghijklmnop leaked" >&2
+    echo "token=sk-$LEAKED_SUFFIX leaked" >&2
     exit 3
     ;;
 esac
