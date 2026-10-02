@@ -30,6 +30,8 @@ export interface HarnessManifest {
   locate: Locate;
   discover: { argv: string[]; parse: ParseRule };
   send: { argv: string[] };
+  /** Run before a send; a non-zero exit means the harness cannot take a turn. */
+  health?: string[];
   reply: "stdout" | "none";
   runsTurn: boolean;
   cwd: "run" | "none";
@@ -57,6 +59,7 @@ type Fields = Record<string, unknown>;
 
 const PLACEHOLDER = /\{[^{}]*\}/g;
 const DISCOVER_PLACEHOLDERS = ["bin", "cwd"];
+const HEALTH_PLACEHOLDERS = ["bin", "cwd"];
 const SEND_PLACEHOLDERS = ["bin", "session", "message", "cwd"];
 
 function fields(value: unknown, field: string, known: string[]): Fields {
@@ -124,6 +127,7 @@ function template(
   field: string,
   allowed: string[],
   required: string[],
+  literalProgram = false,
 ): string[] {
   if (!Array.isArray(value) || value.length === 0)
     throw new ManifestError(field, "must be a non-empty list of arguments");
@@ -135,8 +139,13 @@ function template(
       );
     return item;
   });
-  if (argv[0] !== "{bin}")
-    throw new ManifestError(`${field}[0]`, 'must be exactly "{bin}"');
+  if (argv[0] !== "{bin}" && !(literalProgram && !/[{}]/.test(argv[0] ?? "{")))
+    throw new ManifestError(
+      `${field}[0]`,
+      literalProgram
+        ? 'must be "{bin}" or a literal program name without placeholders'
+        : 'must be exactly "{bin}"',
+    );
   argv.forEach((arg, index) => {
     const found = arg.match(PLACEHOLDER) ?? [];
     if (found.length === 0 && !/[{}]/.test(arg)) return;
@@ -260,6 +269,7 @@ export function validateManifest(value: unknown): HarnessManifest {
     "locate",
     "discover",
     "send",
+    "health",
     "reply",
     "runs_turn",
     "cwd",
@@ -279,6 +289,10 @@ export function validateManifest(value: unknown): HarnessManifest {
     );
   const discover = fields(record.discover, "discover", ["argv", "parse"]);
   const send = fields(record.send, "send", ["argv"]);
+  const health =
+    record.health === undefined
+      ? undefined
+      : template(record.health, "health", HEALTH_PLACEHOLDERS, [], true);
   return {
     name,
     locate: locate(record.locate),
@@ -292,6 +306,7 @@ export function validateManifest(value: unknown): HarnessManifest {
         "message",
       ]),
     },
+    ...(health ? { health } : {}),
     reply: choice(record.reply, "reply", ["stdout", "none"] as const, "none"),
     runsTurn: record.runs_turn,
     cwd: choice(record.cwd, "cwd", ["run", "none"] as const, "run"),

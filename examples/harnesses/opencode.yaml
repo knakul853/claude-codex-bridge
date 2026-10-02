@@ -14,6 +14,10 @@ discover:
 send:
   argv: ["{bin}", "run", "-s", "{session}", "{message}"]
 
+# Optional: refuse to send unless this exits 0 (for a model server that may be
+# down). The URL is environment-specific, so adjust it before enabling.
+# health: ["curl", "-sf", "-m", "5", "http://192.168.1.117:8888/v1/models"]
+
 # `opencode-cli run` starts a model turn, so `send` needs --run.
 runs_turn: true
 reply: stdout

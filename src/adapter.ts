@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { formatAddress, parseAddress } from "./addresses";
 import type { Env } from "./env";
+import { BridgeError } from "./errors";
 import type { HarnessManifest, Locate, ParseRule } from "./manifest";
 import {
   NativeCommandError,
@@ -267,4 +268,32 @@ export async function sendThroughAdapter(
   if (manifest.reply !== "stdout") return {};
   const reply = truncateText(redactText(stdout.trim()), REPLY_LIMIT_BYTES);
   return reply === "" ? {} : { reply };
+}
+
+/**
+ * Runs the manifest's optional health command. Any failure to start it or a
+ * non-zero exit counts as unhealthy, so a harness that cannot take a turn is
+ * refused before anything is sent to it.
+ */
+export async function checkHealth(
+  manifest: HarnessManifest,
+  binary: string,
+  options: { cwd?: string; runner?: ProcessRunner } = {},
+): Promise<void> {
+  if (!manifest.health) return;
+  const cwd = resolve(options.cwd ?? process.cwd());
+  try {
+    await (options.runner ?? nativeProcessRunner).run(
+      expandTemplate(manifest.health, { bin: binary, cwd }),
+      childOptions(manifest, cwd),
+    );
+  } catch (error) {
+    const detail = redactText(
+      error instanceof Error ? error.message : "health command failed",
+    );
+    throw new BridgeError(
+      "harness_unhealthy",
+      `${manifest.name}: health check failed, so nothing was sent (${detail})`,
+    );
+  }
 }

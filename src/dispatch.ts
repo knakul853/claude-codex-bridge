@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import {
+  checkHealth,
   type DiscoveredSession,
   discoverSessions,
   locateBinary,
@@ -21,6 +22,7 @@ import {
   isMessageKind,
   type MessageKind,
 } from "./inbox";
+import { labelPeerMessage } from "./label";
 import {
   type HarnessManifest,
   type LoadedManifest,
@@ -308,11 +310,12 @@ export async function sendMessage(
     };
   }
 
+  if (request.message.trim() === "")
+    throw new Error("a message cannot be empty");
   const message = truncateText(
-    redactText(request.message),
+    redactText(labelPeerMessage(request.message, from)),
     MESSAGE_LIMIT_BYTES,
   );
-  if (message.trim() === "") throw new Error("a message cannot be empty");
   const lane = laneOf(address, deps);
   const audit = {
     id,
@@ -350,6 +353,10 @@ export async function sendMessage(
     );
   }
   const binary = await requireBinary(manifest, deps);
+  await checkHealth(manifest, binary, {
+    ...(request.cwd ? { cwd: request.cwd } : {}),
+    ...(deps.runner ? { runner: deps.runner } : {}),
+  });
   const sent = await sendThroughAdapter(
     manifest,
     binary,

@@ -290,3 +290,27 @@ test("the shipped OpenCode example is a valid manifest", async () => {
     send: { argv: ["{bin}", "run", "-s", "{session}", "{message}"] },
   });
 });
+
+describe("health", () => {
+  test("accepts a literal program or {bin} and keeps it", () => {
+    const curl = ["curl", "-sf", "-m", "5", "http://localhost:8888/v1/models"];
+    expect(validateManifest(manifest({ health: curl })).health).toEqual(curl);
+    expect(
+      validateManifest(manifest({ health: ["{bin}", "ping"] })).health,
+    ).toEqual(["{bin}", "ping"]);
+    expect(validateManifest(manifest()).health).toBeUndefined();
+  });
+
+  test("rejects a placeholder program, message placeholders and bad shapes", () => {
+    for (const health of [
+      ["{session}", "x"],
+      ["{bin}", "{message}"],
+      ["curl", "http://{cwd}/x"],
+      [],
+      "curl -sf",
+      ["curl", ""],
+    ]) {
+      expect(() => validateManifest(manifest({ health }))).toThrow(/health/);
+    }
+  });
+});

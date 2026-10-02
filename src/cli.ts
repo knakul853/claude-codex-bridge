@@ -447,6 +447,7 @@ async function main(): Promise<void> {
       );
       return;
     }
+    const sender = option("--from") ?? "agent";
     const thread = option("--thread");
     const project = option("--project");
     const cwd = option("--cwd");
@@ -471,6 +472,7 @@ async function main(): Promise<void> {
                 timeoutMs: Number(option("--timeout") ?? 60) * 1_000,
                 pollMs: Number(option("--poll") ?? 3) * 1_000,
               },
+          sender,
         ),
       );
       return;
@@ -495,6 +497,7 @@ async function main(): Promise<void> {
             message,
             { composerMs: Number(option("--composer-delay") ?? 3) * 1_000 },
             wait,
+            sender,
           )
         : await sendToThread(
             SqliteThreadStore.open(),
@@ -502,6 +505,7 @@ async function main(): Promise<void> {
             target,
             message,
             wait,
+            sender,
           ),
     );
     return;

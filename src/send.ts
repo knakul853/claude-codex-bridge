@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import type { CodexReviewClient } from "./codex";
 import { settingName } from "./env";
+import { labelPeerMessage } from "./label";
 import type { ProcessRunner } from "./process";
 import {
   type CodexThread,
@@ -344,9 +345,11 @@ export async function openThreadInDesktop(
   store: ThreadStore,
   process: ProcessRunner,
   target: SendTarget,
-  message: string,
+  rawMessage: string,
   autoSend?: AutoSendOptions,
+  from?: string,
 ): Promise<OpenedThread> {
+  const message = from ? labelPeerMessage(rawMessage, from) : rawMessage;
   const {
     root,
     project: projectName,
@@ -396,9 +399,11 @@ export async function sendToThread(
   store: ThreadStore,
   client: CodexReviewClient,
   target: SendTarget,
-  message: string,
+  rawMessage: string,
   wait?: WaitOptions,
+  from?: string,
 ): Promise<SendResult> {
+  const message = from ? labelPeerMessage(rawMessage, from) : rawMessage;
   const thread = resolveThread(store, target);
   const before = await assistantCount(thread);
   await client.queue(thread.id, message);
@@ -428,10 +433,12 @@ export async function steerThread(
   store: ThreadStore,
   process: ProcessRunner,
   target: SendTarget,
-  message: string,
+  rawMessage: string,
   submit: SteerOptions,
   wait?: WaitOptions,
+  from?: string,
 ): Promise<SendResult> {
+  const message = from ? labelPeerMessage(rawMessage, from) : rawMessage;
   const thread = resolveThread(store, target);
   const app = submit.app === undefined ? desktopAppPath() : submit.app;
   if (!app) {
