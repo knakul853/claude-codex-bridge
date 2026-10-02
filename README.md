@@ -364,6 +364,61 @@ left for the next agent to rediscover.
   state after it exits, so only the presence of `pid` distinguishes a session still
   holding memory from a stale record. Interactive sessions report `status`, not `state`.
 
+## Any harness
+
+An address is `harness:session`: `codex:<thread uuid>`, `claude:<session uuid>`,
+`opencode:ses_x`, or `broadcast`. The older flags (`--to <id>`, `--thread`, `--cwd`,
+`--title`) work unchanged, and `--to` also takes `claude:<id>` where it already took a
+bare id.
+
+```bash
+agentplus harnesses                                  # built-ins and manifests, with validation status
+agentplus sessions --harness opencode --cwd /path/to/repo
+agentplus send --to opencode:ses_x --message "..." --cwd /path/to/repo [--run]
+agentplus send --to codex:<thread uuid> --message "..." [--kind handoff --reply-to <id>]
+```
+
+Lane lines carry an optional envelope: `id`, `to`, `reply_to` and `kind`
+(`ask`, `ack`, `handoff` or `fyi`). Lines written without them still read.
+`notify` and `send` take `--kind` and `--reply-to`.
+
+Every `send` through a manifest or to Codex appends one audit line to the target's lane
+(`<harness>.<session>.jsonl`) holding the envelope and the message size, never the
+message itself, which the bridge does not persist. A failure to write that line is
+reported in the result rather than thrown, since the message has already been sent.
+
+### Adding a harness
+
+Drop `<name>.yaml` (or `.json`) in `${XDG_CONFIG_HOME:-~/.config}/agentplus/harnesses/`.
+`agentplus harnesses` validates it and says what is wrong. No code changes. A complete
+example is [`examples/harnesses/opencode.yaml`](examples/harnesses/opencode.yaml).
+
+| field | meaning |
+| --- | --- |
+| `name` | lowercase; must match the file name; `codex`, `claude` and `broadcast` are taken |
+| `locate` | a binary name on `PATH`, an absolute path, or a glob (`~/` allowed); the newest match wins |
+| `discover.argv` | argv template that lists sessions; may use `{cwd}` |
+| `discover.parse` | `format: tsv` with `columns` (`id`, `title`, `updated`, `skip`) and optional `skip_lines`, or `format: json` with `items` and `fields` as dotted paths |
+| `send.argv` | argv template; must contain `{session}` and `{message}`; may use `{cwd}` |
+| `reply` | `stdout` returns what the send printed; `none` (default) returns nothing |
+| `runs_turn` | required; `true` when receiving a message starts a model turn |
+| `cwd` | `run` (default) runs the command in `--cwd`; `none` ignores `--cwd` |
+
+Templates are argv arrays, never a shell string. The first element is `{bin}`, and every
+other placeholder must be a whole argument, so a message such as `; rm -rf ~` or `$(x)`
+reaches the harness as one literal argument. A message that begins with `-` is refused,
+because the harness would read it as an option, unless the template has a literal `--`
+before `{message}`.
+
+When `runs_turn` is `true`, `send` refuses (exit 5, `turn_requires_run`) unless `--run` is
+passed, so an agent cannot start another agent's turn by accident.
+
+To add another CLI such as `pi` or `oh-my-pi`, read its `--help` and fill the fields from
+what it documents: the command that lists sessions and how its output is laid out (tab
+separated columns, or JSON), the command that sends to a session, whether that command
+runs a turn, and whether it needs a working directory. Copy only flags the CLI prints;
+do not guess.
+
 ## Handover contract
 
 The bridge appends this requirement to every worker prompt:

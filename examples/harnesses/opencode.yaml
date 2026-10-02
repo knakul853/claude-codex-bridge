@@ -1,0 +1,20 @@
+# OpenCode, described without code. Copy to
+# ${XDG_CONFIG_HOME:-~/.config}/agentplus/harnesses/opencode.yaml
+name: opencode
+
+# Newest match wins, so the desktop app's versioned CLI is followed across updates.
+locate: ~/Library/Application Support/ai.opencode.desktop/cli/*/opencode-cli
+
+discover:
+  argv: ["{bin}", "session", "list"]
+  parse:
+    format: tsv
+    columns: [id, title, updated]
+
+send:
+  argv: ["{bin}", "run", "-s", "{session}", "{message}"]
+
+# `opencode-cli run` starts a model turn, so `send` needs --run.
+runs_turn: true
+reply: stdout
+cwd: run
