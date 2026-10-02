@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 const roots: string[] = [];
@@ -68,4 +68,23 @@ test("send refuses an empty message instead of submitting nothing", async () => 
   const stderr = await new Response(child.stderr).text();
   expect(await child.exited).toBe(2);
   expect(stderr).toContain("send needs a message");
+});
+
+test("the legacy claude-codex-bridge name reaches the same entry point", async () => {
+  const root = (await Bun.$`mktemp -d /tmp/bridge-alias.XXXXXX`.text()).trim();
+  roots.push(root);
+  const alias = join(root, "claude-codex-bridge");
+  await symlink(cli, alias);
+  for (const command of ["inbox", "notify"]) {
+    const child = Bun.spawn([alias, command, "--help"], {
+      env: { ...process.env, AGENTPLUS_HOME: root },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = await new Response(child.stdout).text();
+    expect(await child.exited).toBe(0);
+    expect(stdout).toContain("agent+ (agentplus");
+    expect(stdout).toContain("inbox [--watch]");
+  }
 });

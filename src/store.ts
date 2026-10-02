@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import {
   chmod,
   link,
@@ -11,13 +11,28 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { type Env, setting } from "./env";
+
+export const STATE_DIR_NAME = ".agentplus";
+export const LEGACY_STATE_DIR_NAME = ".claude-codex-bridge";
+
+export interface HomeLookup {
+  env?: Env;
+  home?: string;
+  exists?: (path: string) => boolean;
+}
 
 // Peer links and inbox lanes are addressed by both agents, and neither knows the
-// other's repository, so they live outside any Git directory.
-export function bridgeHome(): string {
-  return (
-    process.env.CLAUDE_CODEX_HOME ?? join(homedir(), ".claude-codex-bridge")
-  );
+// other's repository, so they live outside any Git directory. A user who ran the
+// tool under its old name keeps that directory; nothing is moved or copied.
+export function bridgeHome(lookup: HomeLookup = {}): string {
+  const configured = setting(lookup.env ?? process.env, "HOME");
+  if (configured) return configured;
+  const home = lookup.home ?? homedir();
+  const current = join(home, STATE_DIR_NAME);
+  const legacy = join(home, LEGACY_STATE_DIR_NAME);
+  const exists = lookup.exists ?? existsSync;
+  return !exists(current) && exists(legacy) ? legacy : current;
 }
 
 export function absent(error: unknown): boolean {

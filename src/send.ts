@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import type { CodexReviewClient } from "./codex";
+import { settingName } from "./env";
 import type { ProcessRunner } from "./process";
 import {
   type CodexThread,
@@ -77,7 +78,7 @@ export interface WaitOptions {
 export type Delivery = "queue" | "steer";
 
 /** Default delivery for callers that pass neither `--steer` nor `--queue`. */
-export const DELIVERY_ENV = "CLAUDE_CODEX_BRIDGE_DELIVERY";
+export const DELIVERY_ENV = settingName("DELIVERY");
 
 const DELIVERIES: readonly Delivery[] = ["queue", "steer"];
 

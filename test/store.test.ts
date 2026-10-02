@@ -13,6 +13,7 @@ import { join } from "node:path";
 import {
   atomicCreate,
   atomicWrite,
+  bridgeHome,
   ensurePrivateDirectory,
   safeRead,
 } from "../src/store";
@@ -111,5 +112,52 @@ describe("atomic writes", () => {
     await atomicCreate(path, { a: 1 });
     await expect(atomicCreate(path, { a: 2 })).rejects.toThrow();
     expect(JSON.parse(await safeRead(path))).toEqual({ a: 1 });
+  });
+});
+
+describe("bridgeHome", () => {
+  const home = "/h";
+  const present = (...paths: string[]) => {
+    const known = new Set(paths);
+    return (path: string) => known.has(path);
+  };
+
+  test("defaults to ~/.agentplus on a fresh machine", () => {
+    expect(bridgeHome({ env: {}, home, exists: present() })).toBe(
+      "/h/.agentplus",
+    );
+  });
+
+  test("keeps using the legacy directory when only it exists", () => {
+    expect(
+      bridgeHome({ env: {}, home, exists: present("/h/.claude-codex-bridge") }),
+    ).toBe("/h/.claude-codex-bridge");
+  });
+
+  test("prefers ~/.agentplus once it exists, even beside the legacy one", () => {
+    expect(
+      bridgeHome({
+        env: {},
+        home,
+        exists: present("/h/.agentplus", "/h/.claude-codex-bridge"),
+      }),
+    ).toBe("/h/.agentplus");
+  });
+
+  test("AGENTPLUS_HOME overrides both, and the old override still works", () => {
+    const exists = present("/h/.agentplus", "/h/.claude-codex-bridge");
+    expect(bridgeHome({ env: { AGENTPLUS_HOME: "/x" }, home, exists })).toBe(
+      "/x",
+    );
+    expect(bridgeHome({ env: { CLAUDE_CODEX_HOME: "/y" }, home, exists })).toBe(
+      "/y",
+    );
+    expect(
+      bridgeHome({
+        env: { AGENTPLUS_HOME: "/x", CLAUDE_CODEX_HOME: "/y" },
+        home,
+        exists,
+      }),
+    ).toBe("/x");
   });
 });

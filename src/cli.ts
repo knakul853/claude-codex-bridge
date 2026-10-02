@@ -11,6 +11,7 @@ import {
   startJob,
 } from "./claude";
 import { NativeCodexReviewClient } from "./codex";
+import { setting } from "./env";
 import { BridgeError } from "./errors";
 import { runHook } from "./hook";
 import {
@@ -51,7 +52,7 @@ import {
   searchThreads,
 } from "./threads";
 
-const USAGE = `claude-codex-bridge <command>
+const USAGE = `agent+ (agentplus, also installed as claude-codex-bridge) <command>
 
 Codex desktop app (has computer use and your browser sessions):
   projects                                   list projects and their roots
@@ -179,8 +180,10 @@ function laneFor(explicit?: string): string {
 
 async function main(): Promise<void> {
   const command = Bun.argv[2];
+  const commandHelp = Bun.argv[3] === "--help" || Bun.argv[3] === "-h";
   if (
     !command ||
+    commandHelp ||
     command === "help" ||
     command === "--help" ||
     command === "-h"
@@ -434,7 +437,7 @@ async function main(): Promise<void> {
     const delivery = resolveDelivery({
       steer: flag("--steer"),
       queue: flag("--queue"),
-      env: process.env[DELIVERY_ENV],
+      env: setting(process.env, "DELIVERY"),
     });
     emit(
       delivery === "steer"

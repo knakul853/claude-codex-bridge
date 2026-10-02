@@ -1,14 +1,17 @@
-# Claude–Codex Bridge
+# agent+
 
-A small local bridge for using Codex as the owner/reviewer while Claude Code
-workers implement tasks in native isolated worktrees.
+A small local bridge between coding-agent harnesses. Today it connects Claude
+Code and Codex; any other harness with a CLI joins by dropping in a manifest
+(see [Adding a harness](#adding-a-harness)), with no code change.
 
-Built for local AI-agent orchestration, multi-agent coding workflows, and
-structured Claude Code → OpenAI Codex handoffs without adding a hosted service.
+Built for local multi-agent coding workflows and structured handoffs without a
+hosted service. The command is `agentplus`; `claude-codex-bridge` stays
+installed as an alias so existing hooks and scripts keep working.
 
-It does not run a scheduler or hosted service. Claude owns worker sessions,
-worktrees, logs, and execution; Codex owns review and integration; Git remains
-the source of truth for code state.
+It does not run a scheduler or hosted service. Each harness owns its own
+sessions, worktrees, logs, and execution; the bridge routes messages and
+handovers between them; Git remains the source of truth for code state. In the
+Claude-worker flow below, Claude implements and Codex reviews and integrates.
 
 ## What it does
 
@@ -46,22 +49,31 @@ git clone https://github.com/knakul853/claude-codex-bridge.git
 cd claude-codex-bridge
 bun install
 bun link
-claude-codex-bridge doctor
-claude-codex-bridge install-hooks
+agentplus doctor
+agentplus install-hooks
 ```
 
 Hook installation updates the user's `~/.claude/settings.json` (or
 `$CLAUDE_CONFIG_DIR/settings.json`) and preserves unrelated settings and hooks.
 The hook applies to every repository and safely does nothing for sessions the
 bridge does not own. `start` refuses to launch until both completion hooks are
-installed, so a worker cannot finish without a delivery path.
+installed, so a worker cannot finish without a delivery path. The installed hook
+keeps calling `claude-codex-bridge hook`, so hooks written before the rename
+need no reinstall.
+
+State lives in `~/.agentplus` (override with `AGENTPLUS_HOME`). If that directory
+is absent and `~/.claude-codex-bridge` exists, the legacy directory is used in
+place; nothing is moved or copied. Each `AGENTPLUS_*` variable
+(`AGENTPLUS_HOME`, `AGENTPLUS_INBOX`, `AGENTPLUS_DELIVERY`) falls back to its
+`CLAUDE_CODEX_*` predecessor (`CLAUDE_CODEX_HOME`, `CLAUDE_CODEX_INBOX`,
+`CLAUDE_CODEX_BRIDGE_DELIVERY`).
 
 ## Use
 
 From a clean, attached Git branch:
 
 ```sh
-claude-codex-bridge start \
+agentplus start \
   --owner-thread 01900000-0000-7000-8000-000000000000 \
   --name "Fix stream replay" \
   --prompt-file ./worker-prompt.txt
@@ -71,7 +83,7 @@ Or pipe a prompt so the bridge does not read it from a file:
 
 ```sh
 printf '%s' 'Inspect the bug, fix it, verify it, and commit locally.' |
-  claude-codex-bridge start --owner-thread "$CODEX_THREAD_ID"
+  agentplus start --owner-thread "$CODEX_THREAD_ID"
 ```
 
 Claude Code's native background command receives the prompt as a positional
@@ -82,9 +94,9 @@ prompts.
 Inspect or continue a recorded session:
 
 ```sh
-claude-codex-bridge status --session <claude-session-uuid>
+agentplus status --session <claude-session-uuid>
 printf '%s' 'Address the owner feedback and re-verify.' |
-  claude-codex-bridge continue --session <claude-session-uuid>
+  agentplus continue --session <claude-session-uuid>
 ```
 
 Claude may implement a background resume as a new native session. The command
@@ -106,10 +118,10 @@ Codex task, or create a new durable task in Codex Desktop:
 
 ```sh
 printf '%s' 'Review this work and return corrections to the same Claude session.' |
-  claude-codex-bridge review --session <claude-session-uuid> --owner-thread <codex-task-id>
+  agentplus review --session <claude-session-uuid> --owner-thread <codex-task-id>
 
 printf '%s' 'Review this work.' |
-  claude-codex-bridge review --session <claude-session-uuid> --new-codex-task
+  agentplus review --session <claude-session-uuid> --new-codex-task
 ```
 
 After the first request, omit both routing options to reuse the recorded Codex
@@ -125,7 +137,7 @@ directory and still act on the right repository. Without it the current director
 is used, which is how a worker ends up in the wrong repo.
 
 ```sh
-claude-codex-bridge start --owner-thread <id> --cwd /path/to/repo --here
+agentplus start --owner-thread <id> --cwd /path/to/repo --here
 ```
 
 `start` cuts a worktree inside the target repo by default and requires a clean
@@ -172,10 +184,10 @@ worker wedged on a permission prompt holds them indefinitely. Spawning is capped
 four live bridge workers (`--max-live`), and the rest is explicit:
 
 ```sh
-claude-codex-bridge peers                        # pairings, with liveness and MB
-claude-codex-bridge reap                          # report only; changes nothing
-claude-codex-bridge reap --apply [--kill-stuck]   # prune finished, optionally wedged
-claude-codex-bridge close --peer <ref> --force --remove-worktree --archive-thread
+agentplus peers                        # pairings, with liveness and MB
+agentplus reap                          # report only; changes nothing
+agentplus reap --apply [--kill-stuck]   # prune finished, optionally wedged
+agentplus close --peer <ref> --force --remove-worktree --archive-thread
 ```
 
 `reap` reports unless `--apply` is passed, because stopping a session discards its
@@ -201,8 +213,8 @@ signalled before the worker. Only worktrees the bridge cut itself are ever remov
 did that itself:
 
 ```sh
-claude-codex-bridge forget --session <claude-session-uuid>
-claude-codex-bridge uninstall-hooks
+agentplus forget --session <claude-session-uuid>
+agentplus uninstall-hooks
 ```
 
 See [architecture and safety details](docs/architecture.md).
@@ -215,15 +227,15 @@ has to click through a real UI must run in the desktop app instead. These comman
 target it.
 
 ```bash
-claude-codex-bridge projects                          # projects and their root directories
-claude-codex-bridge threads --cwd /path/to/repo       # newest first
-claude-codex-bridge search --query "slo" --titles     # thread titles containing it
-claude-codex-bridge search --query "slo" --limit 50   # messages in the 50 newest threads
-claude-codex-bridge send --cwd /path/to/repo --new --message "..."
-claude-codex-bridge send --thread <uuid> --message "..." --wait
-claude-codex-bridge send --thread <uuid> --message "..." --steer   # into the running turn
-claude-codex-bridge read --thread <uuid> --last 3
-claude-codex-bridge watch --thread <uuid>             # block until the next turn
+agentplus projects                          # projects and their root directories
+agentplus threads --cwd /path/to/repo       # newest first
+agentplus search --query "slo" --titles     # thread titles containing it
+agentplus search --query "slo" --limit 50   # messages in the 50 newest threads
+agentplus send --cwd /path/to/repo --new --message "..."
+agentplus send --thread <uuid> --message "..." --wait
+agentplus send --thread <uuid> --message "..." --steer   # into the running turn
+agentplus read --thread <uuid> --last 3
+agentplus watch --thread <uuid>             # block until the next turn
 ```
 
 A destination is a **directory**, with `--project` kept as a convenience. Codex's
@@ -245,7 +257,7 @@ stop before the keystroke and approve the message yourself.
 
 `send --thread` queues by default: the message waits until the thread's current turn
 ends. Pass `--steer` to deliver it into the running turn instead, or set
-`CLAUDE_CODEX_BRIDGE_DELIVERY=steer` to make that the default (`--queue` overrides it
+`AGENTPLUS_DELIVERY=steer` to make that the default (`--queue` overrides it
 for one call). Steering opens the thread in the desktop app with the message
 prefilled and submits it with the focus-checked keystroke, so the app takes focus
 for a few seconds. The key is chosen from the app's own `[desktop]` settings in
@@ -260,16 +272,16 @@ Claude Code publishes a record per live session under `~/.claude/sessions`, so a
 peer can discover sessions and address one without running the `claude` CLI.
 
 ```bash
-claude-codex-bridge sessions                               # live sessions and ids
-claude-codex-bridge sessions --cwd /path/to/repo           # just that directory
-claude-codex-bridge notify --to <session-id> --message "..."
-claude-codex-bridge notify --cwd /path/to/repo --message "..."   # address by directory
-claude-codex-bridge notify --to <session-id> --push --message "..."
-claude-codex-bridge inbox                                  # read this session's lane
-claude-codex-bridge inbox --watch --since <offset>         # block for the next one
+agentplus sessions                               # live sessions and ids
+agentplus sessions --cwd /path/to/repo           # just that directory
+agentplus notify --to <session-id> --message "..."
+agentplus notify --cwd /path/to/repo --message "..."   # address by directory
+agentplus notify --to <session-id> --push --message "..."
+agentplus inbox                                  # read this session's lane
+agentplus inbox --watch --since <offset>         # block for the next one
 ```
 
-Each addressee gets its own append-only lane under `~/.claude-codex-bridge/inbox`,
+Each addressee gets its own append-only lane under `~/.agentplus/inbox`,
 so two Claude sessions watching at once cannot consume each other's messages. An
 unaddressed message goes to the `broadcast` lane. `inbox` with no `--to` resolves
 the caller's own lane from `CLAUDE_CODE_SESSION_ID`.
@@ -310,7 +322,7 @@ left for the next agent to rediscover.
 
   ```toml
   [sandbox_workspace_write]
-  writable_roots = ["<your home directory>/.claude-codex-bridge"]
+  writable_roots = ["<your home directory>/.agentplus"]
   ```
 - **The two session sources disagree on `kind`.** `~/.claude/sessions` reports `bg` where
   `claude agents --json` reports `background`, so only `interactive` is matched on.

@@ -1,5 +1,6 @@
 import { appendFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { setting } from "./env";
 import { bridgeHome, ensurePrivateDirectory } from "./store";
 
 export const BROADCAST_LANE = "broadcast";
@@ -32,7 +33,7 @@ export function laneName(to?: string): string {
  * each other's messages. An unaddressed message goes to the broadcast lane.
  */
 export function inboxLanePath(to?: string, home?: string): string {
-  const override = process.env.CLAUDE_CODEX_INBOX;
+  const override = setting(process.env, "INBOX");
   if (override && to === undefined) return override;
   return join(inboxRoot(home), `${laneName(to)}.jsonl`);
 }
