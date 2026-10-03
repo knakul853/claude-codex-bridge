@@ -1,4 +1,9 @@
-import { appendInbox, type InboxMessage, inboxLanePath } from "./inbox";
+import {
+  appendInbox,
+  type InboxMessage,
+  inboxLanePath,
+  type MessageKind,
+} from "./inbox";
 import { redactText, truncateText } from "./safety";
 import {
   type ClaudeSession,
@@ -19,6 +24,10 @@ export interface NotifyInput {
   pid?: number;
   from: string;
   message: string;
+  /** Envelope fields; an id is generated when none is given. */
+  id?: string;
+  replyTo?: string;
+  kind?: MessageKind;
   /** Also interrupt the live session over its socket, not just queue the lane. */
   push?: boolean;
   at?: () => string;
@@ -27,6 +36,7 @@ export interface NotifyInput {
 }
 
 export interface NotifyResult {
+  id: string;
   lane: string;
   /** Whether the message was recorded on the lane. */
   queued: boolean;
@@ -80,6 +90,7 @@ export async function notifyClaude(input: NotifyInput): Promise<NotifyResult> {
   const target = await resolveTarget(input);
   const addressee = target?.sessionId ?? input.to;
   const lane = inboxLanePath(addressee, input.home);
+  const id = input.id ?? crypto.randomUUID();
 
   let queued = true;
   let laneDetail: string | undefined;
@@ -89,6 +100,9 @@ export async function notifyClaude(input: NotifyInput): Promise<NotifyResult> {
       from: input.from,
       message,
       ...(addressee ? { to: addressee } : {}),
+      id,
+      ...(input.replyTo ? { reply_to: input.replyTo } : {}),
+      ...(input.kind ? { kind: input.kind } : {}),
     } satisfies InboxMessage);
   } catch (error) {
     // A sandboxed sender may be denied the lane while still reaching the
@@ -99,6 +113,7 @@ export async function notifyClaude(input: NotifyInput): Promise<NotifyResult> {
   }
 
   const result: NotifyResult = {
+    id,
     lane,
     queued,
     ...(addressee ? { sessionId: addressee } : {}),

@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "claude-codex-bridge",
+      "name": "agentplus",
       "devDependencies": {
         "@biomejs/biome": "^2.5.12",
         "@types/bun": "latest",

@@ -1,9 +1,11 @@
 # Architecture and safety
 
-The bridge is a CLI plus Claude Code `Stop` and `StopFailure` hooks. It has no
-daemon. A small manifest maps a Claude session UUID to a Codex owner task and a
-Git common directory. Manifests contain no prompt, transcript, reasoning,
-credential, or environment value.
+agent+ is a CLI plus Claude Code `Stop` and `StopFailure` hooks. It has no
+daemon and is harness-agnostic: Claude Code and Codex are built in, and other
+harnesses are described by manifests. For the Claude-worker flow, a small
+manifest maps a Claude session UUID to a Codex owner task and a Git common
+directory. Manifests contain no prompt, transcript, reasoning, credential, or
+environment value.
 
 The owner can be a Codex desktop task. The bridge uses the local `codex queue`
 command only as its delivery transport into that task; the owner does not need
@@ -24,8 +26,8 @@ briefly observe it in the process list. Task prompts must not contain secrets.
 
 ## Ownership
 
-- Claude Code owns worker processes, sessions, logs, and worktrees.
-- Codex owns review and integration.
+- Each harness owns its own processes, sessions, logs, and worktrees.
+- In the Claude-worker flow, Codex owns review and integration.
 - Git owns branch and file state.
 - The bridge owns only routing metadata and delivery state.
 

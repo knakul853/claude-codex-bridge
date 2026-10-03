@@ -184,7 +184,7 @@ async function requireFreeWorktree(
       owner.facts.pid === undefined
         ? ", no process"
         : `, pid ${owner.facts.pid}`
-    }, native state "${owner.facts.state ?? "unknown"}"). Close it with \`claude-codex-bridge close --peer ${owner.peer.id} --force\` and wait for that to confirm, or start the worker in another worktree`,
+    }, native state "${owner.facts.state ?? "unknown"}"). Close it with \`agentplus close --peer ${owner.peer.id} --force\` and wait for that to confirm, or start the worker in another worktree`,
   );
 }
 
@@ -234,7 +234,7 @@ async function rescueLaunch(input: {
     );
     return {
       released: true,
-      detail: `could not stop the worker it had already started (${sessionId}); recorded it as a peer so ${input.agent.cwd} keeps an owner, close it with \`claude-codex-bridge close --peer ${sessionId} --force\``,
+      detail: `could not stop the worker it had already started (${sessionId}); recorded it as a peer so ${input.agent.cwd} keeps an owner, close it with \`agentplus close --peer ${sessionId} --force\``,
     };
   } catch (error) {
     return {
@@ -275,7 +275,7 @@ export async function startJob(input: StartOptions): Promise<BridgeManifest> {
       bridgeHooksInstalled(await readSettings(claudeSettingsPath())));
   if (!(await hooksReady())) {
     throw new Error(
-      "Claude completion hooks are not installed; run `claude-codex-bridge install-hooks`",
+      "Claude completion hooks are not installed; run `agentplus install-hooks`",
     );
   }
   // A fresh worktree has a name nothing else can be holding; --here shares a
@@ -312,7 +312,7 @@ async function publishWorker(
     const live = await liveBridgeWorkers(process, input.home, agents);
     if (live.length >= limit) {
       throw new Error(
-        `${live.length} bridge workers are already live (limit ${limit}). Close one with \`claude-codex-bridge close\`, or raise --max-live`,
+        `${live.length} bridge workers are already live (limit ${limit}). Close one with \`agentplus close\`, or raise --max-live`,
       );
     }
     const worktreeName = `claude-codex-${crypto.randomUUID().slice(0, 8)}`;
@@ -462,7 +462,7 @@ export async function continueJob(input: {
   // second process against the same transcript. Reaching it means the inbox.
   if (isInteractive(agent)) {
     throw new Error(
-      `session ${id} is interactive; message it with \`claude-codex-bridge notify --to ${id}\` instead`,
+      `session ${id} is interactive; message it with \`agentplus notify --to ${id}\` instead`,
     );
   }
   // The native state is the last label the daemon wrote, not a live condition.
@@ -615,7 +615,7 @@ function reviewMessage(input: {
       `changed_files: ${JSON.stringify(input.repository.changedFiles)}`,
       "untrusted_review_instructions_json:",
       JSON.stringify(safeInstructions),
-      "If corrections are needed, send them back with claude-codex-bridge continue --session using this session id. Otherwise integrate only when authorized.",
+      "If corrections are needed, send them back with agentplus continue --session using this session id. Otherwise integrate only when authorized.",
     ].join("\n"),
     8_000,
   );

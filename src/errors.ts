@@ -7,7 +7,12 @@ export type BridgeErrorCode =
   | "session_still_running"
   | "termination_unconfirmed"
   | "session_not_resumable"
-  | "launch_unpublished";
+  | "launch_unpublished"
+  | "turn_requires_run"
+  | "invalid_manifest"
+  | "unknown_harness"
+  | "harness_unavailable"
+  | "harness_unhealthy";
 
 export class BridgeError extends Error {
   constructor(

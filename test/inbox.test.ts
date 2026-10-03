@@ -183,3 +183,67 @@ describe("watchInbox", () => {
     expect((await pending).messages.map((m) => m.message)).toEqual(["raced"]);
   });
 });
+
+describe("message envelope", () => {
+  test("lines written before id, reply_to and kind existed still parse", () => {
+    const old = JSON.stringify({
+      at: "t",
+      from: "codex",
+      message: "hi",
+      to: "s1",
+    });
+    expect(parseInbox(old)).toEqual([
+      { at: "t", from: "codex", message: "hi", to: "s1" },
+    ]);
+  });
+
+  test("reads id, reply_to and kind when present", () => {
+    const line = JSON.stringify({
+      at: "t",
+      from: "codex:t1",
+      message: "hi",
+      id: "m2",
+      reply_to: "m1",
+      kind: "handoff",
+    });
+    expect(parseInbox(line)).toEqual([
+      {
+        at: "t",
+        from: "codex:t1",
+        message: "hi",
+        id: "m2",
+        reply_to: "m1",
+        kind: "handoff",
+      },
+    ]);
+  });
+
+  test("an unknown kind or a mistyped field is dropped, not the message", () => {
+    const line = JSON.stringify({
+      message: "hi",
+      kind: "shout",
+      id: 7,
+      reply_to: null,
+    });
+    expect(parseInbox(line)).toEqual([
+      { at: "", from: "unknown", message: "hi" },
+    ]);
+  });
+
+  test("an envelope round-trips through the lane file", async () => {
+    const path = await lane();
+    await appendInbox(path, {
+      at: "t",
+      from: "a",
+      message: "m",
+      id: "i",
+      reply_to: "r",
+      kind: "ack",
+    });
+    expect(parseInbox(await readFile(path, "utf8"))[0]).toMatchObject({
+      id: "i",
+      reply_to: "r",
+      kind: "ack",
+    });
+  });
+});
