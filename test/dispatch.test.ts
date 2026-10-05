@@ -431,6 +431,72 @@ describe("sendMessage through a manifest adapter", () => {
 });
 
 describe("sendMessage through the built-ins", () => {
+  test("managed workers cannot duplicate their automatic handover with an owner completion", async () => {
+    const sessionId = "55555555-5555-4555-8555-555555555555";
+    const queued: Array<[string, string]> = [];
+    const { deps } = await setup(
+      {},
+      {
+        currentSession: () => sessionId,
+        managedOwner: async (_cwd, current) =>
+          current === sessionId ? "t1" : undefined,
+        threads: () => codexStore(),
+        codex: {
+          queue: async (id: string, message: string) => {
+            queued.push([id, message]);
+          },
+        } as unknown as CodexReviewClient,
+      },
+    );
+
+    for (const kind of ["ack", "handoff"] as const) {
+      const error = await refusal(
+        sendMessage(
+          {
+            to: "codex:t1",
+            message: "completed",
+            kind,
+            cwd: "/repo/worktree",
+          },
+          deps,
+        ),
+      );
+
+      expect(error.code).toBe("managed_completion_uses_handover");
+      expect(error.message).toContain("<agent_handover>");
+    }
+    expect(queued).toEqual([]);
+    expect(
+      await Bun.file(
+        join(deps.laneHome ?? "", "inbox", "codex.t1.jsonl"),
+      ).exists(),
+    ).toBe(false);
+  });
+
+  test("managed workers can still send mid-turn progress to their owner", async () => {
+    const queued: Array<[string, string]> = [];
+    const { deps } = await setup(
+      {},
+      {
+        currentSession: () => "55555555-5555-4555-8555-555555555555",
+        managedOwner: async () => "t1",
+        threads: () => codexStore(),
+        codex: {
+          queue: async (id: string, message: string) => {
+            queued.push([id, message]);
+          },
+        } as unknown as CodexReviewClient,
+      },
+    );
+
+    await sendMessage(
+      { to: "codex:t1", message: "progress", kind: "fyi" },
+      deps,
+    );
+
+    expect(queued).toHaveLength(1);
+  });
+
   test("claude:ID writes that session's lane with the envelope", async () => {
     const { deps } = await setup();
     const outcome = await sendMessage(

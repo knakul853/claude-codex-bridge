@@ -435,6 +435,11 @@ The bridge appends this requirement to every worker prompt:
 <agent_handover>{"disposition":"ready_for_review","summary":"Concise result."}</agent_handover>
 ```
 
+The Stop hook delivers that final handover to the owning Codex thread. A managed
+worker must not also send its completion with `agentplus send --kind ack` or
+`--kind handoff`; the CLI rejects that duplicate path. `ask` and `fyi` remain
+available for genuine mid-turn messages.
+
 Allowed dispositions are `ready_for_review`, `needs_owner`, `blocked`, and
 `failed`. The summary is treated as untrusted data and limited to 4,000 UTF-8
 bytes. The Codex notification separately includes Git state read by the bridge.

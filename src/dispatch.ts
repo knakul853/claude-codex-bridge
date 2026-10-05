@@ -30,10 +30,12 @@ import {
   manifestDirectory,
 } from "./manifest";
 import { notifyClaude } from "./notify";
-import type { ProcessRunner } from "./process";
+import { nativeProcessRunner, type ProcessRunner } from "./process";
+import { readRepositoryStateIfRepo } from "./repository";
 import { redactText, truncateText } from "./safety";
 import { sendToThread } from "./send";
 import { currentSessionId, listClaudeSessions } from "./sessions";
+import { loadManifest } from "./state";
 import { SqliteThreadStore, type ThreadStore } from "./threads";
 
 const MESSAGE_LIMIT_BYTES = 8_000;
@@ -49,6 +51,11 @@ export interface DispatchDeps {
   runner?: ProcessRunner;
   now?: () => string;
   newId?: () => string;
+  currentSession?: () => string | undefined;
+  managedOwner?: (
+    cwd: string,
+    sessionId: string,
+  ) => Promise<string | undefined>;
   threads?: () => ThreadStore;
   codex?: CodexReviewClient;
   sessionsRoot?: string;
@@ -237,6 +244,20 @@ function defaultSender(): string {
   return session ? `claude:${session}` : "agentplus";
 }
 
+async function managedOwner(
+  cwd: string,
+  sessionId: string,
+  deps: DispatchDeps,
+): Promise<string | undefined> {
+  if (deps.managedOwner) return deps.managedOwner(cwd, sessionId);
+  const repository = await readRepositoryStateIfRepo(
+    cwd,
+    deps.runner ?? nativeProcessRunner,
+  );
+  if (!repository) return undefined;
+  return (await loadManifest(repository.commonDir, sessionId))?.ownerThreadId;
+}
+
 /**
  * The record that a message was sent, not the message: the lane carries the
  * envelope and the size, never the body, so nothing a harness was told is
@@ -287,6 +308,24 @@ export async function sendMessage(
   const id = (deps.newId ?? (() => crypto.randomUUID()))();
   const to = formatAddress(address);
   const harness = address.kind === "broadcast" ? BROADCAST : address.harness;
+
+  if (
+    harness === "codex" &&
+    address.kind === "session" &&
+    (kind === "ack" || kind === "handoff")
+  ) {
+    const sessionId = (deps.currentSession ?? currentSessionId)();
+    if (
+      sessionId &&
+      (await managedOwner(request.cwd ?? process.cwd(), sessionId, deps)) ===
+        address.session
+    ) {
+      throw new BridgeError(
+        "managed_completion_uses_handover",
+        "This managed worker's final result is delivered automatically from its final <agent_handover> block, so nothing was sent. Use --kind ask or --kind fyi only for a mid-turn message.",
+      );
+    }
+  }
 
   if (address.kind === "broadcast" || address.harness === "claude") {
     const result = await notifyClaude({

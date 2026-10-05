@@ -9,6 +9,7 @@ export type BridgeErrorCode =
   | "session_not_resumable"
   | "launch_unpublished"
   | "turn_requires_run"
+  | "managed_completion_uses_handover"
   | "invalid_manifest"
   | "unknown_harness"
   | "harness_unavailable"
