@@ -1,5 +1,9 @@
 import { resolve } from "node:path";
-import { nativeProcessRunner, type ProcessRunner } from "./process";
+import {
+  NativeCommandError,
+  nativeProcessRunner,
+  type ProcessRunner,
+} from "./process";
 
 const CHANGED_FILE_LIMIT = 40;
 
@@ -42,4 +46,22 @@ export async function readRepositoryState(
       .slice(0, CHANGED_FILE_LIMIT)
       .map((line) => line.slice(3, 259)),
   };
+}
+
+/** A directory outside any repository has no state to report; every other git failure stays loud. */
+export async function readRepositoryStateIfRepo(
+  cwd: string,
+  runner: ProcessRunner = nativeProcessRunner,
+): Promise<RepositoryState | undefined> {
+  try {
+    return await readRepositoryState(cwd, runner);
+  } catch (error) {
+    if (
+      error instanceof NativeCommandError &&
+      error.exitCode === 128 &&
+      error.detail.includes("not a git repository")
+    )
+      return undefined;
+    throw error;
+  }
 }

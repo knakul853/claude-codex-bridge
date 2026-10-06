@@ -1,14 +1,29 @@
 import { appendFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { setting } from "./env";
 import { bridgeHome, ensurePrivateDirectory } from "./store";
 
 export const BROADCAST_LANE = "broadcast";
 
+export const MESSAGE_KINDS = ["ask", "ack", "handoff", "fyi"] as const;
+export type MessageKind = (typeof MESSAGE_KINDS)[number];
+
+export function isMessageKind(value: unknown): value is MessageKind {
+  return (MESSAGE_KINDS as readonly unknown[]).includes(value);
+}
+
+/**
+ * One lane line. `id`, `reply_to` and `kind` are optional so lines written
+ * before they existed still parse, and so does a reader that ignores them.
+ */
 export interface InboxMessage {
   at: string;
   from: string;
   message: string;
   to?: string;
+  id?: string;
+  reply_to?: string;
+  kind?: MessageKind;
 }
 
 export function inboxRoot(home = bridgeHome()): string {
@@ -32,7 +47,7 @@ export function laneName(to?: string): string {
  * each other's messages. An unaddressed message goes to the broadcast lane.
  */
 export function inboxLanePath(to?: string, home?: string): string {
-  const override = process.env.CLAUDE_CODEX_INBOX;
+  const override = setting(process.env, "INBOX");
   if (override && to === undefined) return override;
   return join(inboxRoot(home), `${laneName(to)}.jsonl`);
 }
@@ -62,6 +77,11 @@ export function parseInbox(text: string): InboxMessage[] {
         from: typeof parsed.from === "string" ? parsed.from : "unknown",
         message: parsed.message,
         ...(typeof parsed.to === "string" ? { to: parsed.to } : {}),
+        ...(typeof parsed.id === "string" ? { id: parsed.id } : {}),
+        ...(typeof parsed.reply_to === "string"
+          ? { reply_to: parsed.reply_to }
+          : {}),
+        ...(isMessageKind(parsed.kind) ? { kind: parsed.kind } : {}),
       });
     } catch {
       // A partially written line is skipped and picked up on the next read.

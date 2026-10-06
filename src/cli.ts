@@ -3,6 +3,7 @@
 import { watch as watchFile } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { claudeSessionFrom, laneFromTarget } from "./addresses";
 import {
   continueJob,
   forgetJob,
@@ -11,11 +12,14 @@ import {
   startJob,
 } from "./claude";
 import { NativeCodexReviewClient } from "./codex";
+import { listHarnesses, listSessions, sendMessage } from "./dispatch";
+import { setting } from "./env";
 import { BridgeError } from "./errors";
 import { runHook } from "./hook";
 import {
   inboxLanePath,
   inboxRoot,
+  isMessageKind,
   parseInbox,
   readLane,
   watchInbox,
@@ -51,7 +55,7 @@ import {
   searchThreads,
 } from "./threads";
 
-const USAGE = `claude-codex-bridge <command>
+const USAGE = `agent+ (agentplus, also installed as claude-codex-bridge) <command>
 
 Codex desktop app (has computer use and your browser sessions):
   projects                                   list projects and their roots
@@ -80,8 +84,18 @@ Messages from Codex to a Claude session:
       [--title TITLE] [--pid PID]            address by title or exact process
       [--cwd PATH] [--from NAME]             address by directory instead of id
       [--push]                               also interrupt it over its socket
+      [--kind K] [--reply-to ID]             envelope: kind is ask|ack|handoff|fyi
   inbox [--watch] [--to SESSION]             read this session's lane, or block
       [--since N] [--timeout S]              for the next message on it
+
+Any harness (built in, or described by a manifest in
+\${XDG_CONFIG_HOME:-~/.config}/agentplus/harnesses/NAME.yaml):
+  harnesses                                  list harnesses and manifest status
+  sessions --harness NAME [--cwd PATH]       list that harness's sessions
+  send --to NAME:SESSION --message TEXT      NAME is codex, claude, or a manifest;
+      [--cwd PATH] [--run]                   --run lets a harness that starts a
+      [--from NAME] [--kind K]               model turn on receipt take the send
+      [--reply-to ID]                        --to broadcast writes the shared lane
 
 Claude workers, owned by a Codex thread:
   start --owner-thread UUID [--cwd PATH]     run a Claude worker on that repo
@@ -173,14 +187,16 @@ async function doctor(): Promise<Record<string, string>> {
 // A Claude session invoking the bridge inherits its own id, so reading "my lane"
 // needs no argument.
 function laneFor(explicit?: string): string {
-  const to = explicit ?? currentSessionId();
+  const to = explicit ? laneFromTarget(explicit) : currentSessionId();
   return inboxLanePath(to, undefined);
 }
 
 async function main(): Promise<void> {
   const command = Bun.argv[2];
+  const commandHelp = Bun.argv[3] === "--help" || Bun.argv[3] === "-h";
   if (
     !command ||
+    commandHelp ||
     command === "help" ||
     command === "--help" ||
     command === "-h"
@@ -214,6 +230,15 @@ async function main(): Promise<void> {
     emit({ ok: true, settings: path });
     return;
   }
+  if (command === "harnesses") {
+    emit({ harnesses: await listHarnesses() });
+    return;
+  }
+  if (command === "sessions" && option("--harness") !== undefined) {
+    const cwd = option("--cwd");
+    emit(await listSessions(required("--harness"), cwd ? { cwd } : {}));
+    return;
+  }
   if (command === "sessions") {
     const cwd = option("--cwd");
     const wanted = cwd ? resolve(cwd) : undefined;
@@ -224,9 +249,14 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "notify") {
-    const to = option("--to");
+    const target = option("--to");
+    const to = target === undefined ? undefined : claudeSessionFrom(target);
     const cwd = option("--cwd");
     const title = option("--title");
+    const kind = option("--kind");
+    if (kind !== undefined && !isMessageKind(kind))
+      throw new CliError("--kind must be one of ask, ack, handoff, fyi", 2);
+    const replyTo = option("--reply-to");
     const pidText = option("--pid");
     const pid = pidText === undefined ? undefined : Number(pidText);
     if (pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0))
@@ -236,6 +266,8 @@ async function main(): Promise<void> {
       ...(cwd ? { cwd } : {}),
       ...(title ? { title } : {}),
       ...(pid !== undefined ? { pid } : {}),
+      ...(kind !== undefined && isMessageKind(kind) ? { kind } : {}),
+      ...(replyTo ? { replyTo } : {}),
       from: option("--from") ?? "codex",
       message: option("--message") ?? (await prompt()),
       push: flag("--push"),
@@ -397,6 +429,25 @@ async function main(): Promise<void> {
         2,
       );
     }
+    if (option("--to") !== undefined) {
+      const cwd = option("--cwd");
+      const from = option("--from");
+      const kind = option("--kind");
+      const replyTo = option("--reply-to");
+      emit(
+        await sendMessage({
+          to: required("--to"),
+          message,
+          run: flag("--run"),
+          ...(cwd ? { cwd } : {}),
+          ...(from ? { from } : {}),
+          ...(kind ? { kind } : {}),
+          ...(replyTo ? { replyTo } : {}),
+        }),
+      );
+      return;
+    }
+    const sender = option("--from") ?? "agent";
     const thread = option("--thread");
     const project = option("--project");
     const cwd = option("--cwd");
@@ -421,6 +472,7 @@ async function main(): Promise<void> {
                 timeoutMs: Number(option("--timeout") ?? 60) * 1_000,
                 pollMs: Number(option("--poll") ?? 3) * 1_000,
               },
+          sender,
         ),
       );
       return;
@@ -434,7 +486,7 @@ async function main(): Promise<void> {
     const delivery = resolveDelivery({
       steer: flag("--steer"),
       queue: flag("--queue"),
-      env: process.env[DELIVERY_ENV],
+      env: setting(process.env, "DELIVERY"),
     });
     emit(
       delivery === "steer"
@@ -445,6 +497,7 @@ async function main(): Promise<void> {
             message,
             { composerMs: Number(option("--composer-delay") ?? 3) * 1_000 },
             wait,
+            sender,
           )
         : await sendToThread(
             SqliteThreadStore.open(),
@@ -452,6 +505,7 @@ async function main(): Promise<void> {
             target,
             message,
             wait,
+            sender,
           ),
     );
     return;

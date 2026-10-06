@@ -9,7 +9,7 @@ import {
 } from "./contracts";
 import { listPeers } from "./peers";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
-import { type RepositoryState, readRepositoryState } from "./repository";
+import { type RepositoryState, readRepositoryStateIfRepo } from "./repository";
 import { redactText, truncateText } from "./safety";
 import { claimDelivery, loadManifest, settleDelivery } from "./state";
 
@@ -27,7 +27,8 @@ export interface HookInput {
 }
 
 export interface HookDependencies {
-  gitState(cwd: string): Promise<RepositoryState>;
+  /** Undefined when the directory is not inside a git repository. */
+  gitState(cwd: string): Promise<RepositoryState | undefined>;
   loadManifest(
     commonDir: string,
     sessionId: string,
@@ -223,6 +224,7 @@ export async function handleHook(
 ): Promise<HookResult> {
   const input = parseHookInput(inputValue);
   const git = await deps.gitState(input.cwd);
+  if (!git) return { kind: "allow" };
   const manifest = await deps.loadManifest(git.commonDir, input.session_id);
   if (!manifest) return { kind: "allow" };
   if (
@@ -299,7 +301,7 @@ export async function runHook(
 ): Promise<HookResult> {
   const input = parseHookInput(value);
   return handleHook(input, {
-    gitState: (cwd) => readRepositoryState(cwd, process),
+    gitState: (cwd) => readRepositoryStateIfRepo(cwd, process),
     loadManifest,
     currentSession: async (cwd, manifest) => {
       const matches = (await listPeers()).filter(

@@ -155,8 +155,8 @@ function refuse(input: {
   throw new BridgeError(
     "worktree_owner_active",
     abandoned
-      ? `a bridge reservation for ${input.cwd} looks abandoned but cannot be proved so (${holder}), and it is never taken away on a guess. Check \`claude-codex-bridge peers\`, then delete ${input.path} once you know nothing is publishing there`
-      : `another bridge start or continue is already publishing a worker for ${input.cwd} (${holder}). Let it finish and read \`claude-codex-bridge peers\`, or use a different worktree`,
+      ? `a bridge reservation for ${input.cwd} looks abandoned but cannot be proved so (${holder}), and it is never taken away on a guess. Check \`agentplus peers\`, then delete ${input.path} once you know nothing is publishing there`
+      : `another bridge start or continue is already publishing a worker for ${input.cwd} (${holder}). Let it finish and read \`agentplus peers\`, or use a different worktree`,
   );
 }
 

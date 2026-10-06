@@ -78,6 +78,37 @@ describe("notifyClaude", () => {
     expect(stored[0]?.to).toBe(sessionA);
   });
 
+  test("stamps every message with an id, and carries kind and reply_to when given", async () => {
+    const home = await temporary("bridge-notify-home-");
+    const plain = await notifyClaude({
+      to: sessionA,
+      from: "codex",
+      message: "first",
+      home,
+      sessionsRoot: await registry([]),
+    });
+    expect(plain.id).toMatch(/^[0-9a-f-]{36}$/);
+    const reply = await notifyClaude({
+      to: sessionA,
+      from: "codex",
+      message: "second",
+      kind: "ack",
+      replyTo: plain.id,
+      id: "chosen-id",
+      home,
+      sessionsRoot: await registry([]),
+    });
+    expect(reply.id).toBe("chosen-id");
+    const stored = await laneMessages(reply.lane as string);
+    expect(stored[0]?.id).toBe(plain.id);
+    expect(stored[0]?.kind).toBeUndefined();
+    expect(stored[1]).toMatchObject({
+      id: "chosen-id",
+      kind: "ack",
+      reply_to: plain.id,
+    });
+  });
+
   test("records on the lane even when a socket nudge is attempted", async () => {
     const home = await temporary("bridge-notify-home-");
     const sessionsRoot = await registry([

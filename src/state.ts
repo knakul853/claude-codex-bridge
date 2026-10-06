@@ -17,6 +17,8 @@ import {
   safeRead,
 } from "./store";
 
+// Per-repository state keeps its original name so manifests written before the
+// rename are still found.
 const STATE_DIR = "claude-codex-bridge";
 
 function stateRoot(gitCommonDir: string): string {
