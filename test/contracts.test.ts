@@ -80,6 +80,19 @@ describe("handover contract", () => {
     ).toThrow(/at most 4000 bytes/);
   });
 
+  test("explains automatic completion delivery and limits manual progress", () => {
+    const prompt = withHandoverContract("Review the change and report back");
+    expect(prompt).toContain(
+      "The Stop hook automatically sends this handover to your owner",
+    );
+    expect(prompt).toContain(
+      "Do not also send your final result with agentplus send, regardless of --kind",
+    );
+    expect(prompt).toContain(
+      "Use --kind ask or --kind fyi only for actionable mid-turn questions or progress",
+    );
+  });
+
   test("bounds prompts and appends the neutral contract", () => {
     expect(withHandoverContract("Do the work")).toContain("<agent_handover>");
     expect(() => withHandoverContract("")).toThrow();

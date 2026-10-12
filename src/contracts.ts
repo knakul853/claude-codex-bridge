@@ -316,7 +316,8 @@ export function parsePeerLink(value: unknown): PeerLink {
   return link;
 }
 
-export const HANDOVER_INSTRUCTION = `Finish your final response with exactly one block:
+export const HANDOVER_INSTRUCTION = `The Stop hook automatically sends this handover to your owner. Do not also send your final result with agentplus send, regardless of --kind. Use --kind ask or --kind fyi only for actionable mid-turn questions or progress that the owner needs before completion.
+Finish your final response with exactly one block:
 <agent_handover>{"disposition":"ready_for_review|needs_owner|blocked|failed","summary":"A concise, credential-free handover."}</agent_handover>
 Do not put any text after that block.`;
 
