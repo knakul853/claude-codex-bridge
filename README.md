@@ -392,6 +392,7 @@ reported in the result rather than thrown, since the message has already been se
 Drop `<name>.yaml` (or `.json`) in `${XDG_CONFIG_HOME:-~/.config}/agentplus/harnesses/`.
 `agentplus harnesses` validates it and says what is wrong. No code changes. A complete
 example is [`examples/harnesses/opencode.yaml`](examples/harnesses/opencode.yaml).
+DeepSeek Harness desktop needs a plugin inside the app as well: [`integrations/deepseek`](integrations/deepseek/README.md).
 
 | field | meaning |
 | --- | --- |

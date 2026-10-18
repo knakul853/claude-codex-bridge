@@ -1,0 +1,22 @@
+# DeepSeek Harness desktop, through the agentplus-bridge plugin (integrations/deepseek/README.md).
+# Copy to ${XDG_CONFIG_HOME:-~/.config}/agentplus/harnesses/deepseek.yaml and point `locate`
+# at your clone.
+name: deepseek
+
+locate: ~/Documents/github/claude-codex-bridge/integrations/deepseek/agentplus-deepseek.ts
+
+discover:
+  argv: ["{bin}", "sessions"]
+  parse:
+    format: tsv
+    columns: [id, title, updated]
+
+send:
+  argv: ["{bin}", "send", "{session}", "--", "{message}"]
+
+health: ["{bin}", "ping"]
+
+# A message starts a model turn in the desktop session; the reply is printed when the turn ends.
+runs_turn: true
+reply: stdout
+cwd: none
