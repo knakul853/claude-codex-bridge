@@ -3,6 +3,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodexReviewClient, CreatedCodexTask } from "../src/codex";
+import { BridgeError } from "../src/errors";
 import {
   appProcessName,
   autoSendScript,
@@ -114,20 +115,21 @@ describe("resolveProject", () => {
 });
 
 describe("resolveThread", () => {
-  test("picks the newest thread whose cwd is a project root", () => {
+  test("--latest picks the newest thread whose cwd is a project root", () => {
     const threads = [
       thread({ id: "newest", cwd: "/repo/b", updatedAtMs: 30 }),
       thread({ id: "older", cwd: "/repo/a", updatedAtMs: 20 }),
       thread({ id: "elsewhere", cwd: "/repo/c", updatedAtMs: 99 }),
     ];
-    expect(resolveThread(store(threads), { project: "aurora-nuclei" }).id).toBe(
-      "newest",
-    );
+    expect(
+      resolveThread(store(threads), { project: "aurora-nuclei", latest: true })
+        .id,
+    ).toBe("newest");
   });
 
   test("explains what to do when the project has no persisted thread", () => {
     expect(() =>
-      resolveThread(store([]), { project: "aurora-nuclei" }),
+      resolveThread(store([]), { project: "aurora-nuclei", latest: true }),
     ).toThrow(/has no thread yet/);
   });
 
@@ -145,9 +147,10 @@ describe("resolveThread", () => {
       updatedAtMs: 5,
       rolloutPath: null,
     };
-    expect(resolveThread(store([thread]), { cwd: "/repo/unlisted" }).id).toBe(
-      "t-unlisted",
-    );
+    expect(
+      resolveThread(store([thread]), { cwd: "/repo/unlisted", latest: true })
+        .id,
+    ).toBe("t-unlisted");
   });
 });
 
@@ -266,7 +269,7 @@ describe("sendToThread", () => {
     const result = await sendToThread(
       store([thread({ id: "t9" })]),
       client,
-      { project: "aurora-nuclei" },
+      { project: "aurora-nuclei", latest: true },
       "run the QA brief",
     );
     expect(client.sent).toEqual([["t9", "run the QA brief"]]);
@@ -317,6 +320,72 @@ describe("sendToThread", () => {
     );
     expect(result.timedOut).toBe(true);
     expect(result.reply).toBeUndefined();
+  });
+});
+
+describe("send by directory without a thread", () => {
+  const userThreads = [
+    thread({ id: "user-guardian", label: "Guardian review", updatedAtMs: 30 }),
+    thread({ id: "user-older", label: "older work", updatedAtMs: 20 }),
+  ];
+
+  test("send --cwd without --new or --thread delivers nothing", async () => {
+    const client = recordingClient();
+    await expect(
+      sendToThread(store(userThreads), client, { cwd: "/repo/a" }, "review"),
+    ).rejects.toThrow(/send --new --cwd/);
+    expect(client.sent).toEqual([]);
+  });
+
+  test("steer by directory refuses before opening the app", async () => {
+    const ran: string[][] = [];
+    await expect(
+      steerThread(
+        store(userThreads),
+        {
+          run: async (argv: string[]) => {
+            ran.push(argv);
+            return { stdout: "", stderr: "", exitCode: 0 };
+          },
+        },
+        { project: "aurora-nuclei" },
+        "review",
+        {
+          composerMs: 1,
+          sleep: async () => {},
+          app: "/Applications/Codex.app",
+        },
+      ),
+    ).rejects.toThrow(/send --thread <id>/);
+    expect(ran).toEqual([]);
+  });
+
+  test("the refusal lists the threads there so a caller can name one", () => {
+    let refusal: unknown;
+    try {
+      resolveThread(store(userThreads), { cwd: "/repo/a" });
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(BridgeError);
+    expect((refusal as BridgeError).code).toBe("thread_not_named");
+    expect((refusal as BridgeError).message).toContain(
+      "user-guardian  Guardian review",
+    );
+    expect((refusal as BridgeError).message).toContain(
+      "user-older  older work",
+    );
+  });
+
+  test("--latest is the explicit opt-in to the newest thread there", async () => {
+    const client = recordingClient();
+    await sendToThread(
+      store(userThreads),
+      client,
+      { cwd: "/repo/a", latest: true },
+      "go",
+    );
+    expect(client.sent).toEqual([["user-guardian", "go"]]);
   });
 });
 

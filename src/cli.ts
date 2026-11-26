@@ -63,13 +63,14 @@ Codex desktop app (has computer use and your browser sessions):
   search --query TEXT [--titles]             threads whose title, or with no
       [--project N | --cwd PATH] [--limit N] --titles whose messages, contain TEXT;
                                              scans the newest --limit (50)
-  send --new --cwd PATH --message TEXT       open the app on that directory,
+  send --new --cwd PATH --message TEXT       new work: open the app on that dir,
                                              prefill, press return, print the id
       [--project N]                          address by project instead of path
       [--no-send]                            stop before the keystroke
       [--composer-delay S] [--timeout S] [--poll S]
-  send --thread UUID --message TEXT [--wait] queue into an existing thread
-  send --cwd PATH --message TEXT [--wait]    queue into that directory's newest
+  send --thread UUID --message TEXT [--wait] follow up in a thread you opened
+                                             or were given (the id --new printed);
+                                             a re-review reuses that thread
       [--steer]                              deliver into the running turn now,
                                              through the desktop app, instead
                                              of after it; see ${DELIVERY_ENV}
@@ -457,6 +458,7 @@ async function main(): Promise<void> {
       ...(project ? { project } : {}),
       ...(cwd ? { cwd } : {}),
       ...(root ? { root } : {}),
+      ...(flag("--latest") ? { latest: true } : {}),
     };
     if (flag("--new")) {
       emit(

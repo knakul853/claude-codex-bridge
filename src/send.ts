@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import type { CodexReviewClient } from "./codex";
 import { settingName } from "./env";
+import { BridgeError } from "./errors";
 import { labelPeerMessage } from "./label";
 import type { ProcessRunner } from "./process";
 import {
@@ -18,7 +19,11 @@ export interface SendTarget {
   project?: string;
   root?: string;
   cwd?: string;
+  /** Opt-in for a human: deliver into the newest thread in the directory or project. */
+  latest?: boolean;
 }
+
+const LISTED_THREADS = 5;
 
 /**
  * A directory is the exact address: Codex's project table is a UI grouping that
@@ -51,12 +56,34 @@ export function resolveThread(
     throw new Error(
       "pass --thread, --cwd, or --project to choose a destination",
     );
-  const newest = store.threads({ roots: scope.roots, limit: 1 })[0];
+  const recent = store.threads({
+    roots: scope.roots,
+    limit: target.latest ? 1 : LISTED_THREADS,
+  });
+  if (!target.latest) throw threadNotNamed(scope.label, recent);
+  const newest = recent[0];
   if (!newest)
     throw new Error(
       `${scope.label} has no thread yet. open one with --new, or send any message in Codex so it is persisted, then retry`,
     );
   return newest;
+}
+
+// The newest thread in a directory is usually one the user is working in, so a
+// sender that names only a directory would land in a conversation it never owned.
+function threadNotNamed(label: string, recent: CodexThread[]): BridgeError {
+  const listing = recent.length
+    ? `threads in ${label}, newest first:\n${recent.map((t) => `  ${t.id}  ${t.label}`).join("\n")}`
+    : `${label} has no thread yet.`;
+  return new BridgeError(
+    "thread_not_named",
+    [
+      `refusing to send: --cwd/--project names a directory, not a thread, and the newest thread there may be someone else's conversation.`,
+      `new task: send --new --cwd PATH --message TEXT (prints the new thread id)`,
+      `follow-up: send --thread <id> --message TEXT (the id --new printed)`,
+      listing,
+    ].join("\n"),
+  );
 }
 
 export interface WaitOptions {

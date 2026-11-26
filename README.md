@@ -231,16 +231,22 @@ agentplus projects                          # projects and their root directorie
 agentplus threads --cwd /path/to/repo       # newest first
 agentplus search --query "slo" --titles     # thread titles containing it
 agentplus search --query "slo" --limit 50   # messages in the 50 newest threads
-agentplus send --cwd /path/to/repo --new --message "..."
-agentplus send --thread <uuid> --message "..." --wait
+agentplus send --new --cwd /path/to/repo --message "..."   # new work; prints the thread id
+agentplus send --thread <uuid> --message "..." --wait      # follow-up in that thread
 agentplus send --thread <uuid> --message "..." --steer   # into the running turn
 agentplus read --thread <uuid> --last 3
 agentplus watch --thread <uuid>             # block until the next turn
 ```
 
-A destination is a **directory**, with `--project` kept as a convenience. Codex's
-project table is a UI grouping: it omits working directories entirely and lets two
-projects share one root, so a path addresses a thread that a project name cannot.
+Every send names its thread: `--new` for new work, `--thread <id>` for a follow-up,
+using the id `--new` printed (a re-review reuses the thread the first review got).
+`--cwd` or `--project` without either is refused with exit 5 and code
+`thread_not_named`, listing the newest threads there: the newest thread in a
+directory is usually a conversation someone else is having, not yours.
+
+A new thread's workspace is a **directory**, with `--project` kept as a convenience.
+Codex's project table is a UI grouping: it omits working directories entirely and lets
+two projects share one root, so a path addresses a workspace that a project name cannot.
 
 `watch` blocks on filesystem events, not a poll interval, so waiting on Codex costs
 nothing while it thinks and returns the moment it answers. Exit code 3 means the
