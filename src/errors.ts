@@ -13,7 +13,8 @@ export type BridgeErrorCode =
   | "invalid_manifest"
   | "unknown_harness"
   | "harness_unavailable"
-  | "harness_unhealthy";
+  | "harness_unhealthy"
+  | "thread_not_named";
 
 export class BridgeError extends Error {
   constructor(
