@@ -179,9 +179,11 @@ test("queues once when only the prose around the handover is rewritten", async (
   expect(queued).toHaveLength(1);
 });
 
-test("queues again when the handover or the Git head changes", async () => {
+test("queues one handover per session turn despite a rewritten summary or Git state", async () => {
   let head = "a".repeat(40);
+  let currentManifest = manifest;
   const { deps, queued } = dependencies({
+    loadManifest: async () => currentManifest,
     gitState: async () => ({
       commonDir: "/repo/.git",
       root: "/repo/example",
@@ -200,7 +202,21 @@ test("queues again when the handover or the Git head changes", async () => {
   );
   head = "b".repeat(40);
   await handleHook(stop(`Done.\n\n${handover}`), deps);
-  expect(queued).toHaveLength(3);
+  expect(queued).toHaveLength(1);
+
+  currentManifest = { ...manifest, resumedAt: "2026-09-10T00:00:00.000Z" };
+  await handleHook(stop(`Done.\n\n${handover}`), deps);
+  expect(queued).toHaveLength(2);
+});
+
+test("delivers a valid handover after an earlier failure in the same turn", async () => {
+  const { deps, queued } = dependencies();
+  await handleHook({ ...stop("invalid"), stop_hook_active: true }, deps);
+  await handleHook(stop(handover), deps);
+  await handleHook(stop(handover), deps);
+  expect(queued).toHaveLength(2);
+  expect(queued[0]).toContain("protocol_failure");
+  expect(queued[1]).toContain("ready_for_review");
 });
 
 test("allows silently when the cwd is not inside a git repository", async () => {
