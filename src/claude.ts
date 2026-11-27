@@ -20,6 +20,7 @@ import {
 import {
   forgetState,
   handedOverSessions,
+  hasDeliveryInTurn,
   loadManifest,
   saveManifest,
   writeManifest,
@@ -527,6 +528,8 @@ async function resumeWorker(
   reservation: WorktreeReservation,
 ): Promise<ContinueResult> {
   let resumed: AgentRecord | undefined;
+  let staged = false;
+  let resumedManifest: BridgeManifest | undefined;
   const actions: string[] = [];
   try {
     const id = manifest.sessionId;
@@ -540,7 +543,12 @@ async function resumeWorker(
     });
     actions.push(...settled.actions);
     await requireFreeWorktree(agent.cwd, settled.agents, process, input.home);
-    const resumedAt = (input.now ?? (() => new Date().toISOString()))();
+    resumedManifest = parseManifest({
+      ...manifest,
+      resumedAt: (input.now ?? (() => new Date().toISOString()))(),
+    });
+    await saveManifest(resumedManifest);
+    staged = true;
     const launch = await process.run(
       ["claude", "--resume", id, "--bg", withHandoverContract(input.prompt)],
       {
@@ -550,20 +558,17 @@ async function resumeWorker(
     resumed = await launchedAgent(process, launch.stdout);
     await requireRepositoryBinding(process, resumed.cwd, manifest.gitCommonDir);
     if (resumed.sessionId === manifest.sessionId) {
-      // The session kept its id, so its earlier deliveries would otherwise
-      // read as this turn's handover. Stamped only once the resume launched:
-      // a failed one leaves the last delivered handover standing.
-      const resumedManifest = parseManifest({
-        ...manifest,
-        resumedAt,
-      });
-      await saveManifest(resumedManifest);
       await reservation.release();
       return { manifest: resumedManifest, actions };
     }
+    if (!(await hasDeliveryInTurn(resumedManifest)))
+      await saveManifest(manifest);
     const continuation = parseManifest({
-      ...manifest,
+      schemaVersion: manifest.schemaVersion,
       sessionId: parseSessionId(resumed.sessionId),
+      ownerThreadId: manifest.ownerThreadId,
+      ...(manifest.name ? { name: manifest.name } : {}),
+      gitCommonDir: manifest.gitCommonDir,
       createdAt: (input.now ?? (() => new Date().toISOString()))(),
     });
     await writeManifest(continuation);
@@ -582,7 +587,16 @@ async function resumeWorker(
     return { manifest: continuation, actions };
   } catch (error) {
     if (!resumed) {
-      await reservation.release();
+      try {
+        if (
+          staged &&
+          resumedManifest &&
+          !(await hasDeliveryInTurn(resumedManifest))
+        )
+          await saveManifest(manifest);
+      } finally {
+        await reservation.release();
+      }
       throw error;
     }
     throw await unpublished(error, reservation, {

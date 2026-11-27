@@ -3,6 +3,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { continueJob, forgetJob, jobStatus, startJob } from "../src/claude";
 import { BridgeError } from "../src/errors";
+import { handleHook } from "../src/hook";
 import { linkPeer, listPeers } from "../src/peers";
 import { NativeCommandError, type ProcessRunner } from "../src/process";
 import {
@@ -255,6 +256,8 @@ test("tracks the new session id returned by a background continuation", async ()
   });
 
   expect(continuation.manifest.sessionId).toBe(continuedId);
+  expect((await loadManifest(commonDir, sessionId))?.resumedAt).toBeUndefined();
+  expect(continuation.manifest.resumedAt).toBeUndefined();
   expect(
     await readFile(
       join(commonDir, "claude-codex-bridge", "jobs", `${continuedId}.json`),
@@ -748,9 +751,9 @@ function staleRunner(input: {
           return { stdout: "stopped\n", stderr: "", exitCode: 0 };
         }
         if (argv[1] === "--resume") {
+          await input.onResume?.();
           if (input.resumeFails)
             throw new NativeCommandError("claude", 1, "resume refused");
-          await input.onResume?.();
           return {
             stdout: `backgrounded · ${input.shortId}\n`,
             stderr: "",
@@ -813,6 +816,34 @@ async function continuable(prefix: string): Promise<{
     repo.home,
   );
   return { root: repo.root, commonDir: repo.commonDir, home: repo.home };
+}
+
+function handoverFixture(repo: { root: string; commonDir: string }) {
+  const queued: string[] = [];
+  const deps = {
+    gitState: async () => ({
+      commonDir: repo.commonDir,
+      root: repo.root,
+      branch: "main",
+      head: "a".repeat(40),
+      clean: true,
+      changedFiles: [],
+    }),
+    loadManifest,
+    currentSession: async () => sessionId,
+    claimDelivery,
+    settleDelivery,
+    queue: async (_threadId: string, message: string) => {
+      queued.push(message);
+    },
+  };
+  const stop = (summary: string) => ({
+    session_id: sessionId,
+    cwd: repo.root,
+    hook_event_name: "Stop",
+    last_assistant_message: `<agent_handover>${JSON.stringify({ disposition: "ready_for_review", summary })}</agent_handover>`,
+  });
+  return { deps, queued, stop };
 }
 
 test("continues a session the inventory still calls blocked with no process", async () => {
@@ -979,6 +1010,66 @@ test("counts a handover delivered while the resumed worker is launching", async 
     process: recorder.process,
   });
   expect(status.disposition).toBe("finished");
+});
+
+test("delivers a fast resumed worker's handover as a new turn", async () => {
+  const repo = await continuable("bridge-continue-fast-handover");
+  const { deps, queued, stop } = handoverFixture(repo);
+  await handleHook(stop("previous turn"), deps);
+  const recorder = staleRunner({
+    sessionId,
+    shortId: "44444444",
+    cwd: repo.root,
+    commonDir: repo.commonDir,
+    state: "blocked",
+    pid: 4242,
+    onResume: async () => {
+      await handleHook(stop("new turn"), deps);
+    },
+  });
+
+  await continueJob({
+    sessionId,
+    prompt: "address the owner feedback",
+    gitCommonDir: repo.commonDir,
+    process: recorder.process,
+    home: repo.home,
+  });
+
+  expect(queued).toHaveLength(2);
+});
+
+test("keeps a handover sent while a resume command reports failure", async () => {
+  const repo = await continuable("bridge-continue-failed-fast-handover");
+  const { deps, queued, stop } = handoverFixture(repo);
+  await handleHook(stop("previous turn"), deps);
+  const recorder = staleRunner({
+    sessionId,
+    shortId: "44444444",
+    cwd: repo.root,
+    commonDir: repo.commonDir,
+    state: "blocked",
+    pid: 4242,
+    resumeFails: true,
+    onResume: async () => {
+      await handleHook(stop("new turn"), deps);
+    },
+  });
+
+  await expect(
+    continueJob({
+      sessionId,
+      prompt: "address the owner feedback",
+      gitCommonDir: repo.commonDir,
+      process: recorder.process,
+      home: repo.home,
+    }),
+  ).rejects.toThrow("resume refused");
+
+  expect(queued).toHaveLength(2);
+  expect(
+    (await loadManifest(repo.commonDir, sessionId))?.resumedAt,
+  ).toBeDefined();
 });
 
 test("keeps the last delivered handover when a resume fails to launch", async () => {

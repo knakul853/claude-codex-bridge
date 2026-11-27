@@ -39,6 +39,46 @@ function deliveryPath(gitCommonDir: string, eventId: string): string {
   return join(stateRoot(gitCommonDir), "deliveries", `${eventId}.json`);
 }
 
+export type DeliveryOutcome =
+  | "handover"
+  | "protocol_failure"
+  | "runtime_failure";
+
+export function deliveryIdentity(
+  manifest: BridgeManifest,
+  outcome: DeliveryOutcome,
+): string {
+  const hash = new Bun.CryptoHasher("sha256");
+  for (const part of [
+    manifest.sessionId,
+    manifest.resumedAt ?? manifest.createdAt,
+    outcome,
+  ]) {
+    hash.update(part);
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+export async function hasDeliveryInTurn(
+  manifest: BridgeManifest,
+): Promise<boolean> {
+  for (const outcome of [
+    "handover",
+    "protocol_failure",
+    "runtime_failure",
+  ] as const) {
+    if (
+      await loadDelivery(
+        manifest.gitCommonDir,
+        deliveryIdentity(manifest, outcome),
+      )
+    )
+      return true;
+  }
+  return false;
+}
+
 export async function writeManifest(value: BridgeManifest): Promise<string> {
   const manifest = parseManifest(value);
   await ensurePrivateDirectory(stateRoot(manifest.gitCommonDir));

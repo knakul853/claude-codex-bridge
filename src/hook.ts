@@ -11,7 +11,12 @@ import { listPeers } from "./peers";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
 import { type RepositoryState, readRepositoryStateIfRepo } from "./repository";
 import { redactText, truncateText } from "./safety";
-import { claimDelivery, loadManifest, settleDelivery } from "./state";
+import {
+  claimDelivery,
+  deliveryIdentity,
+  loadManifest,
+  settleDelivery,
+} from "./state";
 
 const OWNER_MESSAGE_LIMIT_BYTES = 8_000;
 
@@ -125,21 +130,6 @@ export function parseHookInput(value: unknown): HookInput {
 
 function samePath(left: string, right: string): boolean {
   return resolve(left) === resolve(right);
-}
-
-type Outcome = "handover" | "protocol_failure" | "runtime_failure";
-
-function deliveryIdentity(manifest: BridgeManifest, outcome: Outcome): string {
-  const hash = new Bun.CryptoHasher("sha256");
-  for (const part of [
-    manifest.sessionId,
-    manifest.resumedAt ?? manifest.createdAt,
-    outcome,
-  ]) {
-    hash.update(part);
-    hash.update("\0");
-  }
-  return hash.digest("hex");
 }
 
 function notification(input: {
