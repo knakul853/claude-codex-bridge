@@ -11,7 +11,12 @@ import { listPeers } from "./peers";
 import { nativeProcessRunner, type ProcessRunner } from "./process";
 import { type RepositoryState, readRepositoryStateIfRepo } from "./repository";
 import { redactText, truncateText } from "./safety";
-import { claimDelivery, loadManifest, settleDelivery } from "./state";
+import {
+  claimDelivery,
+  deliveryIdentity,
+  loadManifest,
+  settleDelivery,
+} from "./state";
 
 const OWNER_MESSAGE_LIMIT_BYTES = 8_000;
 
@@ -127,42 +132,6 @@ function samePath(left: string, right: string): boolean {
   return resolve(left) === resolve(right);
 }
 
-type Outcome = "handover" | "protocol_failure" | "runtime_failure";
-
-/**
- * What the owner is actually being told, reduced to a stable identity. Hooks
- * rewrite the prose around a handover between one Stop and the next, so hashing
- * the assistant message made a rewording look like a second event; the parsed
- * handover and the independently read Git state are what change when there is
- * genuinely something new to deliver. Every part is hashed, never emitted.
- */
-function deliveryIdentity(input: {
-  sessionId: string;
-  outcome: Outcome;
-  git: RepositoryState;
-  handover?: AgentHandover;
-  runtimeFailure?: string;
-}): string {
-  const hash = new Bun.CryptoHasher("sha256");
-  const parts = [
-    input.sessionId,
-    input.outcome,
-    input.git.head,
-    input.git.branch,
-    input.git.clean ? "clean" : "dirty",
-    JSON.stringify([...input.git.changedFiles].sort()),
-    input.handover
-      ? JSON.stringify([input.handover.disposition, input.handover.summary])
-      : "",
-    input.runtimeFailure ?? "",
-  ];
-  for (const part of parts) {
-    hash.update(part);
-    hash.update("\0");
-  }
-  return hash.digest("hex");
-}
-
 function notification(input: {
   manifest: BridgeManifest;
   handover?: AgentHandover;
@@ -237,15 +206,9 @@ export async function handleHook(
   if (currentSession && currentSession !== input.session_id) {
     return { kind: "allow" };
   }
-  const sessionId = input.session_id;
   if (input.hook_event_name === "StopFailure") {
     const runtimeFailure = input.error ?? "Runtime failure without detail.";
-    const id = deliveryIdentity({
-      sessionId,
-      outcome: "runtime_failure",
-      git,
-      runtimeFailure,
-    });
+    const id = deliveryIdentity(manifest, "runtime_failure");
     return deliver(
       input,
       manifest,
@@ -262,14 +225,7 @@ export async function handleHook(
     if (!input.stop_hook_active) {
       return { kind: "block", reason: handoverBlockReason(error) };
     }
-    // Nothing parsed, so there is no payload to identify this by. The message
-    // the owner gets says only that no handover arrived, which makes two such
-    // stops at one revision the same notification.
-    const id = deliveryIdentity({
-      sessionId,
-      outcome: "protocol_failure",
-      git,
-    });
+    const id = deliveryIdentity(manifest, "protocol_failure");
     return deliver(
       input,
       manifest,
@@ -279,12 +235,7 @@ export async function handleHook(
       deps,
     );
   }
-  const id = deliveryIdentity({
-    sessionId,
-    outcome: "handover",
-    git,
-    handover,
-  });
+  const id = deliveryIdentity(manifest, "handover");
   return deliver(
     input,
     manifest,
